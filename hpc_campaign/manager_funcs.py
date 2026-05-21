@@ -338,7 +338,7 @@ def process_data(
 
         if args.remote_data:
             filesize = 0
-            if args.s3_datetime:
+            if getattr(args, "s3_datetime", None):
                 mt = parse_date_to_utc(args.s3_datetime)
             else:
                 mt = 0
@@ -740,7 +740,7 @@ def add_time_series(args: argparse.Namespace, cur: sqlite3.Cursor, con: sqlite3.
 
 
 def get_host_name(args: argparse.Namespace):
-    if args.s3_endpoint:
+    if getattr(args, "s3_endpoint", None):
         longhost = args.s3_endpoint
     else:
         longhost = getfqdn()
