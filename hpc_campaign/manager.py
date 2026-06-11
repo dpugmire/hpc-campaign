@@ -544,16 +544,7 @@ class Manager:  # pylint: disable=too-many-public-methods
             return buf.getvalue(), resolved_format
         raise TypeError(f"Unsupported visualization image input type: {type(image)!r}")
 
-    def _coerce_scalar_field_input(
-        self,
-        data,
-        dtype: str | None,
-        shape: list[int] | tuple[int, int] | None,
-        metadata,
-        layout: str,
-        compression: str,
-        encoding: str,
-    ) -> tuple[bytes, dict]:
+    def _validate_scalar_field_storage_options(self, layout: str, compression: str, encoding: str):
         layout_value = str(layout or "").strip().lower()
         if layout_value != "row-major":
             raise ValueError("Only row-major scalar field layout is supported currently")
@@ -566,44 +557,69 @@ class Manager:  # pylint: disable=too-many-public-methods
         if encoding_value != "raw":
             raise ValueError("Only encoding='raw' is supported for scalar fields currently")
 
+    def _normalize_scalar_field_shape(self, shape: list[int] | tuple[int, int] | None) -> tuple[int, ...]:
         shape_tuple = tuple(int(dim) for dim in shape) if shape is not None else ()
         if shape_tuple and len(shape_tuple) != 2:
             raise ValueError("shape=[height, width] must contain exactly two dimensions")
+        return shape_tuple
 
+    def _normalize_scalar_field_input_data(self, data):
         if isinstance(data, memoryview):
-            data = data.tobytes()
+            return data.tobytes()
         if isinstance(data, bytearray):
-            data = bytes(data)
+            return bytes(data)
+        return data
 
-        arr: np.ndarray
-        if isinstance(data, bytes):
-            if dtype is None:
-                raise ValueError("dtype is required when scalar field data is bytes")
-            if len(shape_tuple) != 2:
-                raise ValueError("shape=[height, width] is required when scalar field data is bytes")
-            storage_dtype = np.dtype(dtype).newbyteorder("<")
-            if storage_dtype.kind not in {"f", "u", "i"}:
-                raise ValueError(f"Unsupported scalar field dtype: {storage_dtype.name}")
-            payload = data
-            expected = math.prod(shape_tuple) * storage_dtype.itemsize
-            if len(payload) != expected:
-                raise ValueError(f"Scalar field byte payload has {len(payload)} bytes; expected {expected}")
-            arr = np.frombuffer(payload, dtype=storage_dtype).reshape(shape_tuple)
-        else:
-            arr = np.asarray(data)
-            if arr.ndim != 2:
-                raise ValueError("scalar_field_data requires a rank-2 array or explicit shape=[height, width]")
-            if len(shape_tuple) == 2 and shape_tuple != tuple(int(dim) for dim in arr.shape):
-                raise ValueError(f"shape={list(shape_tuple)} does not match scalar field array shape={list(arr.shape)}")
-            shape_tuple = tuple(int(dim) for dim in arr.shape)
-            storage_dtype = np.dtype(dtype if dtype is not None else arr.dtype).newbyteorder("<")
-            if storage_dtype.kind not in {"f", "u", "i"}:
-                raise ValueError(f"Unsupported scalar field dtype: {storage_dtype.name}")
+    def _scalar_field_storage_dtype(self, dtype) -> np.dtype:
+        storage_dtype = np.dtype(dtype).newbyteorder("<")
+        if storage_dtype.kind not in {"f", "u", "i"}:
+            raise ValueError(f"Unsupported scalar field dtype: {storage_dtype.name}")
+        return storage_dtype
 
-            arr = np.ascontiguousarray(arr.astype(storage_dtype, copy=False))
-            payload = arr.tobytes(order="C")
+    def _coerce_scalar_field_bytes(
+        self,
+        data: bytes,
+        dtype: str | None,
+        shape_tuple: tuple[int, ...],
+    ) -> tuple[bytes, np.ndarray, np.dtype]:
+        if dtype is None:
+            raise ValueError("dtype is required when scalar field data is bytes")
+        if len(shape_tuple) != 2:
+            raise ValueError("shape=[height, width] is required when scalar field data is bytes")
 
-        if len(shape_tuple) != 2 or shape_tuple[0] <= 0 or shape_tuple[1] <= 0:
+        storage_dtype = self._scalar_field_storage_dtype(dtype)
+        expected = math.prod(shape_tuple) * storage_dtype.itemsize
+        if len(data) != expected:
+            raise ValueError(f"Scalar field byte payload has {len(data)} bytes; expected {expected}")
+
+        arr = np.frombuffer(data, dtype=storage_dtype).reshape(shape_tuple)
+        return data, arr, storage_dtype
+
+    def _coerce_scalar_field_array(
+        self,
+        data,
+        dtype: str | None,
+        shape_tuple: tuple[int, ...],
+    ) -> tuple[bytes, np.ndarray, np.dtype, tuple[int, ...]]:
+        arr = np.asarray(data)
+        if arr.ndim != 2:
+            raise ValueError("scalar_field_data requires a rank-2 array or explicit shape=[height, width]")
+        if len(shape_tuple) == 2 and shape_tuple != tuple(int(dim) for dim in arr.shape):
+            raise ValueError(f"shape={list(shape_tuple)} does not match scalar field array shape={list(arr.shape)}")
+
+        array_shape = tuple(int(dim) for dim in arr.shape)
+        storage_dtype = self._scalar_field_storage_dtype(dtype if dtype is not None else arr.dtype)
+        arr = np.ascontiguousarray(arr.astype(storage_dtype, copy=False))
+        return arr.tobytes(order="C"), arr, storage_dtype, array_shape
+
+    def _build_scalar_field_metadata(
+        self,
+        metadata,
+        shape_tuple: tuple[int, ...],
+        storage_dtype: np.dtype,
+        arr: np.ndarray,
+    ) -> dict:
+        if shape_tuple[0] <= 0 or shape_tuple[1] <= 0:
             raise ValueError("Scalar field shape must be [height, width] with positive dimensions")
 
         scalar_metadata = dict(metadata or {})
@@ -634,6 +650,31 @@ class Manager:  # pylint: disable=too-many-public-methods
                 scalar_metadata.setdefault("min", float(np.min(finite)))
                 scalar_metadata.setdefault("max", float(np.max(finite)))
 
+        return scalar_metadata
+
+    def _coerce_scalar_field_input(
+        self,
+        data,
+        dtype: str | None,
+        shape: list[int] | tuple[int, int] | None,
+        metadata,
+        layout: str,
+        compression: str,
+        encoding: str,
+    ) -> tuple[bytes, dict]:
+        self._validate_scalar_field_storage_options(layout, compression, encoding)
+        shape_tuple = self._normalize_scalar_field_shape(shape)
+        data = self._normalize_scalar_field_input_data(data)
+
+        if isinstance(data, bytes):
+            payload, arr, storage_dtype = self._coerce_scalar_field_bytes(data, dtype, shape_tuple)
+        else:
+            payload, arr, storage_dtype, shape_tuple = self._coerce_scalar_field_array(data, dtype, shape_tuple)
+
+        if len(shape_tuple) != 2:
+            raise ValueError("Scalar field shape must be [height, width] with positive dimensions")
+
+        scalar_metadata = self._build_scalar_field_metadata(metadata, shape_tuple, storage_dtype, arr)
         return payload, scalar_metadata
 
     def _normalize_visualization_variable_specs(self, variables, source_dataset: str | None):

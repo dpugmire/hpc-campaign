@@ -520,7 +520,7 @@ def info_scalar_fields(  # pylint: disable=too-many-locals
             try:
                 metadata = json.loads(row["scalar_metadata"])
                 dataset_info.metadata = metadata if isinstance(metadata, dict) else None
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 dataset_info.metadata = None
 
 
