@@ -42,6 +42,10 @@ The [sub-command] argument can take one of the following values
 
 * **add_archival_storage** Register an archival location (tape system, https, s3)
 * **data** Add ADIOS2 or HDF5 files
+* **scalar_field_data** Add one structured scalar-field representation item
+* **gaussian_splat_data** Add one Gaussian-splat representation item
+* **create_representation** Relate alternate representation items to ground-truth variables
+* **append_representation_item** Append one explicitly mapped timestep
 * **image** Add images, embedded or remote optionally with an embedded thumbnail image
 * **text** Add text files, embedded or just reference to remote file
 * **add_time_series** Organizing a series of individual data files as a single entry with extra dimension for time
@@ -183,6 +187,57 @@ If ``name`` is a short token, the visualization sequence is stored under
 ``sequence_name`` to provide the exact sequence name. If image names are not
 provided explicitly, they are generated as children of the sequence name, using
 ``steps`` when supplied.
+
+**Alternate scalar-data representations**
+
+``SCALAR_FIELD`` and ``GAUSSIAN_SPLAT`` are data representations, not rendered
+visualizations. Write each timestep with ``scalar_field_data`` or
+``gaussian_splat_data``, then use ``create_representation`` and
+``append_representation_item`` to identify its ground-truth dataset, variable,
+source step, and physical time.
+
+.. code-block:: python
+
+  manager.gaussian_splat_data(
+      {
+          "centers": centers,
+          "log_scales": log_scales,
+          "angles": angles,
+          "amplitudes": amplitudes,
+          "bias": bias,
+      },
+      name="splats/pressure.000010.raw",
+      coordinate_space="normalized",
+      coordinate_transform={
+          "type": "affine",
+          "physical_from_stored": {
+              "scale": [4.4, -5.0],
+              "offset": [0.2, 2.5],
+          },
+      },
+      value_space="normalized",
+      value_transform={
+          "type": "affine",
+          "physical_from_stored": {"scale": 0.02388, "offset": 0.00184},
+      },
+  )
+
+  repid = manager.create_representation(
+      name="output/representations/pressure/gaussian",
+      representation_format="GAUSSIAN_SPLAT",
+      sources=[{"dataset": "output", "variable": "pressure"}],
+      temporal_interpolation="linear",
+  )
+  manager.append_representation_item(
+      repid,
+      "splats/pressure.000010.raw",
+      source_step=10,
+      source_time=0.5,
+  )
+
+See :doc:`data_representations` for the conceptual model, exact Gaussian binary
+layout and evaluation formula, multi-source mappings, metrics, CLI manifests,
+and future compatibility considerations.
 
 **4. text**
 

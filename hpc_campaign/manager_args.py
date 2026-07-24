@@ -11,6 +11,8 @@ __accepted_commands__ = [
     "text",
     "image",
     "scalar-field",
+    "gaussian-splat",
+    "representation",
     "visualization-sequence",
     "add-archival-storage",
     "archived-replica",
@@ -89,7 +91,7 @@ class ArgParser:
                 raise ValueError("Invalid arguments for text: when using --name <name>, only one text file is allowed")
 
     # pylint: disable=too-many-statements
-    def setup_args(self, prog: str | None) -> dict:
+    def setup_args(self, prog: str | None) -> dict:  # pylint: disable=too-many-locals
         parser = argparse.ArgumentParser(
             prog=prog,
             formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -303,6 +305,67 @@ dtype automatically unless overridden. Raw byte inputs require --shape and
             help="Optional replica name to store in the archive.",
         )
 
+        # parser for the "gaussian-splat" command
+        parser_gaussian_splat = argparse.ArgumentParser(
+            prog=f"{prog} <archive> gaussian-splat",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            description="""
+Add one 2D scalar Gaussian-splat timestep to the archive. The input must
+be a NumPy .npz file containing centers, log_scales, angles, amplitudes,
+and bias arrays. Coordinate/value spaces and any required transforms are
+provided by --metadata-json or their explicit command-line options.
+""",
+        )
+        parsers["gaussian-splat"] = parser_gaussian_splat
+        parser_gaussian_splat.add_argument("file", help="NumPy .npz Gaussian-splat parameter file")
+        parser_gaussian_splat.add_argument(
+            "--name",
+            "-n",
+            default=None,
+            help="Representation item dataset name in the campaign hierarchy",
+        )
+        parser_gaussian_splat.add_argument(
+            "--metadata-json",
+            default=None,
+            metavar="file",
+            help="JSON object describing coordinate/value spaces, transforms, and optional provenance.",
+        )
+        parser_gaussian_splat.add_argument(
+            "--coordinate-space",
+            choices=("normalized", "physical"),
+            default=None,
+            help="Coordinate space for centers and scales; overrides metadata JSON.",
+        )
+        parser_gaussian_splat.add_argument(
+            "--value-space",
+            choices=("normalized", "physical"),
+            default=None,
+            help="Value space for amplitudes and bias; overrides metadata JSON.",
+        )
+        parser_gaussian_splat.add_argument(
+            "--replica-name",
+            default=None,
+            help="Optional replica name to store in the archive.",
+        )
+
+        # parser for the generic "representation" command
+        parser_representation = argparse.ArgumentParser(
+            prog=f"{prog} <archive> representation",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            description="""
+Create or append to a generic alternate data representation using a JSON
+manifest. A creation manifest includes name, format, and sources. An append
+manifest may contain only name and items when the representation already exists.
+""",
+        )
+        parsers["representation"] = parser_representation
+        parser_representation.add_argument("manifest", help="JSON representation manifest")
+        parser_representation.add_argument(
+            "--replace",
+            help="Replace an existing representation definition and all of its item associations",
+            action="store_true",
+        )
+
         # parser for the "visualization-sequence" command
         parser_vis_sequence = argparse.ArgumentParser(
             prog=f"{prog} <archive> visualization-sequence",
@@ -311,7 +374,8 @@ dtype automatically unless overridden. Raw byte inputs require --shape and
 Add or replace a visualization sequence from a JSON manifest. The manifest
 contains the same fields as the Python Manager.visualization_sequence() API:
 name, vis_type, variables, items, and optional source_dataset, thumbnail_name,
-thumbnail_uuid, metadata, and replace.
+thumbnail_uuid, metadata, and replace. Items must refer to fixed IMAGE datasets;
+scalar fields and Gaussian splats use the representation command.
 """,
         )
         parsers["visualization-sequence"] = parser_vis_sequence
@@ -452,6 +516,16 @@ One may need to run upgrade several times to reach the newest format.
             del args.value_encoding
             del args.metadata_json
             del args.replica_name
+        elif command == "gaussian-splat":
+            del args.file
+            del args.name
+            del args.metadata_json
+            del args.coordinate_space
+            del args.value_space
+            del args.replica_name
+        elif command == "representation":
+            del args.manifest
+            del args.replace
         elif command == "visualization-sequence":
             del args.manifest
             del args.replace

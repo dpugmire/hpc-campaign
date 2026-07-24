@@ -47,6 +47,9 @@ The [sub-command] argument can take one of the following values
 * **archived-replica** Create a replica of a dataset pointing to an archival storage location
 * **dataset** Add ADIOS2 or HDF5 files
 * **delete** Delete dataset/image/text, one or all replicas from a campaign archive
+* **scalar-field** Add one structured scalar-field representation item
+* **gaussian-splat** Add one Gaussian-splat representation item
+* **representation** Create or append a data representation from a JSON manifest
 * **image** Add images, embedded or remote optionally with an embedded thumbnail image
 * **info** List the content of a campaign archive
 * **text** Add text files, embedded or just reference to remote file
@@ -155,12 +158,12 @@ Example usage:
 .. code-block:: bash
 
   hpc_campaign manager demoproject/test_campaign_001 scalar-field pressure.000000.raw \
-    --name output/visualizations/pressure_scalar_field/scalar.000000.raw \
+    --name output/representations/pressure_scalar_field/scalar.000000.raw \
     --shape 128 128 \
     --dtype float32
 
   hpc_campaign manager demoproject/test_campaign_001 scalar-field pressure.000000.npy \
-    --name output/visualizations/pressure_scalar_field/scalar.000000.raw
+    --name output/representations/pressure_scalar_field/scalar.000000.raw
 
 
 Additional options for scalar fields include:
@@ -171,32 +174,49 @@ Additional options for scalar fields include:
 * ``--value-encoding`` scalar value representation. Currently only ``direct`` is supported.
 * ``--metadata-json <FILE>`` adds extra scalar field metadata from a JSON object.
 
-**7. visualization-sequence**
+**7. gaussian-splat**
 
-Add or replace a visualization sequence from a JSON manifest. This is the
-recommended CLI path for scalar-field sequences because variables and items are
-structured data.
+Add one two-dimensional scalar Gaussian-splat timestep. The input is a NumPy
+``.npz`` file containing ``centers``, ``log_scales``, ``angles``,
+``amplitudes``, and ``bias`` arrays. Coordinate and value spaces must be
+explicit. Normalized spaces require typed transform objects in the metadata
+JSON.
+
+.. code-block:: bash
+
+  hpc_campaign manager demoproject/test_campaign_001 gaussian-splat \
+    pressure.000010.npz \
+    --name output/representations/pressure_gaussian/splat.000010.raw \
+    --metadata-json pressure_space.json
+
+**8. representation**
+
+Create or append a generic alternate data representation from a JSON manifest.
+The same relationship is used for scalar fields and Gaussian splats. Every item
+is one complete timestep and explicitly maps back to a step of each
+ground-truth source variable.
 
 Example manifest:
 
 .. code-block:: json
 
   {
-    "name": "output/visualizations/pressure_scalar_field",
-    "vis_type": "heatmap",
-    "source_dataset": "output",
-    "variables": [{"name": "pressure", "role": "color-by"}],
+    "name": "output/representations/pressure_scalar_field",
+    "format": "SCALAR_FIELD",
+    "sources": [{"dataset": "output", "variable": "pressure"}],
+    "temporal_interpolation": "none",
     "items": [
       {
-        "type": "SCALAR_FIELD",
-        "name": "output/visualizations/pressure_scalar_field/scalar.000000.raw"
+        "dataset": "output/representations/pressure_scalar_field/scalar.000000.raw",
+        "source_step": 0,
+        "source_time": 0.0
       },
       {
-        "type": "SCALAR_FIELD",
-        "name": "output/visualizations/pressure_scalar_field/scalar.000001.raw"
+        "dataset": "output/representations/pressure_scalar_field/scalar.000001.raw",
+        "source_step": 1,
+        "source_time": 0.1
       }
     ],
-    "metadata": {"colormap": "viridis"},
     "replace": true
   }
 
@@ -204,10 +224,23 @@ Example usage:
 
 .. code-block:: bash
 
-  hpc_campaign manager demoproject/test_campaign_001 visualization-sequence pressure_sequence.json
+  hpc_campaign manager demoproject/test_campaign_001 representation pressure_representation.json
+
+See :doc:`data_representations` for the complete manifest, Gaussian payload,
+source-selection, transform, metric, and append contracts.
+
+**9. visualization-sequence**
+
+Add or replace a fixed rendered visualization sequence from a JSON manifest.
+Visualization sequence items are ``IMAGE`` datasets. Structured scalar fields
+and Gaussian splats use the ``representation`` command instead.
+
+.. code-block:: bash
+
+  hpc_campaign manager demoproject/test_campaign_001 visualization-sequence rendered_images.json
 
 
-**8. info**
+**10. info**
 
 Prints the content and metadata of a campaign archive file.
 Example usage:
@@ -219,7 +252,7 @@ Example usage:
 The optional options allow listing replicas, entries that have been deleted and checksums. A complete list of options can be found in the help menu (`-h` option).
 
 
-**9. text**
+**11. text**
 
 Add one or more text files to the archive. If requested, text files are stored within the archive. In that case, zlib is used to compress the text file.
 
@@ -333,4 +366,3 @@ Comparing the campaign archive size to the data it points to can be done by the 
 
   $ du -sh /path/to/adios-campaign-store/demoproject/test_campaign_001 info.aca
   127K     /path/to/adios-campaign-store/demoproject/test_campaign_001 info.aca
-

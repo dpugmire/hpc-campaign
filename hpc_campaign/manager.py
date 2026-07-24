@@ -25,6 +25,7 @@ from .key import read_key
 from .manager_args import ArgParser
 from .manager_funcs import (
     add_archival_storage,
+    add_gaussian_splat_data,
     add_image_data,
     add_scalar_field_data,
     add_time_series,
@@ -37,6 +38,15 @@ from .manager_funcs import (
     delete_time_series,
     set_default_args,
     update,
+)
+from .representations import (
+    add_representation_metric as add_representation_metric_to_archive,
+)
+from .representations import (
+    append_representation_item as append_representation_item_to_archive,
+)
+from .representations import (
+    create_representation as create_representation_in_archive,
 )
 from .upgrade import upgrade_aca
 from .utils import (
@@ -285,6 +295,40 @@ class Manager:  # pylint: disable=too-many-public-methods
             self.open(create=True, truncate=False)
         add_scalar_field_data(cmd_args, self.cur, self.con)
 
+    def gaussian_splat_data(
+        self,
+        data,
+        name: str | None = None,
+        metadata=None,
+        coordinate_space: str | None = None,
+        value_space: str | None = None,
+        coordinate_transform=None,
+        value_transform=None,
+        replica_name: str | None = None,
+        verbose: int | None = None,
+    ):
+        payload, splat_metadata = self._coerce_gaussian_splat_input(
+            data=data,
+            metadata=metadata,
+            coordinate_space=coordinate_space,
+            value_space=value_space,
+            coordinate_transform=coordinate_transform,
+            value_transform=value_transform,
+        )
+        cmd_args = self._build_command_args(
+            "gaussian_splat_data",
+            {
+                "gaussian_splat_data": payload,
+                "gaussian_splat_metadata": splat_metadata,
+                "name": name,
+                "replica_name": replica_name,
+                "verbose": self.args.verbose if verbose is None else int(verbose),
+            },
+        )
+        if not self.connected:
+            self.open(create=True, truncate=False)
+        add_gaussian_splat_data(cmd_args, self.cur, self.con)
+
     def delete_uuid(self, uuid: str):
         if not self.connected:
             self.open(create=True, truncate=False)
@@ -365,6 +409,84 @@ class Manager:  # pylint: disable=too-many-public-methods
         if not self.connected:
             self.open(create=True, truncate=False)
         add_time_series(cmd_args, self.cur, self.con)
+
+    def create_representation(
+        self,
+        name: str,
+        representation_format: str,
+        sources,
+        field_name: str | None = None,
+        temporal_interpolation: str = "none",
+        parameter_correspondence: str | None = None,
+        metadata: dict | None = None,
+        replace: bool = False,
+    ) -> int:
+        if not self.connected:
+            self.open(create=True, truncate=False)
+        return create_representation_in_archive(
+            self.cur,
+            self.con,
+            name=name,
+            representation_format=representation_format,
+            sources=sources,
+            field_name=field_name,
+            temporal_interpolation=temporal_interpolation,
+            parameter_correspondence=parameter_correspondence,
+            metadata=metadata,
+            replace=replace,
+        )
+
+    def append_representation_item(
+        self,
+        representation: int | str,
+        dataset: str,
+        logical_time: float | None = None,
+        source_selections=None,
+        source_step: int | None = None,
+        source_time: float | None = None,
+        metrics=None,
+        metadata: dict | None = None,
+        item_order: int | None = None,
+    ) -> int:
+        if not self.connected:
+            self.open(create=True, truncate=False)
+        return append_representation_item_to_archive(
+            self.cur,
+            self.con,
+            representation=representation,
+            dataset=dataset,
+            logical_time=logical_time,
+            source_selections=source_selections,
+            source_step=source_step,
+            source_time=source_time,
+            metrics=metrics,
+            metadata=metadata,
+            item_order=item_order,
+        )
+
+    def add_representation_metric(
+        self,
+        representation: int | str,
+        name: str,
+        value: float,
+        units: str | None = None,
+        norm: str | None = None,
+        relative: bool = False,
+        metadata: dict | None = None,
+    ) -> int:
+        if not self.connected:
+            self.open(create=True, truncate=False)
+        return add_representation_metric_to_archive(
+            self.cur,
+            self.con,
+            representation=representation,
+            name=name,
+            value=value,
+            units=units,
+            norm=norm,
+            relative=relative,
+            metadata=metadata,
+        )
 
     def visualization_sequence(
         self,
@@ -677,6 +799,127 @@ class Manager:  # pylint: disable=too-many-public-methods
         scalar_metadata = self._build_scalar_field_metadata(metadata, shape_tuple, storage_dtype, arr)
         return payload, scalar_metadata
 
+    def _coerce_gaussian_splat_input(  # pylint: disable=too-many-statements
+        self,
+        data,
+        metadata,
+        coordinate_space: str | None,
+        value_space: str | None,
+        coordinate_transform,
+        value_transform,
+    ) -> tuple[bytes, dict]:
+        if not isinstance(data, dict):
+            raise TypeError("gaussian_splat_data requires a dictionary of parameter arrays")
+        required_components = ("centers", "log_scales", "angles", "amplitudes", "bias")
+        missing = [component for component in required_components if component not in data]
+        if missing:
+            raise ValueError(f"Gaussian-splat data is missing components: {', '.join(missing)}")
+
+        centers = np.asarray(data["centers"])
+        if centers.ndim != 2 or centers.shape[1] != 2 or centers.shape[0] <= 0:
+            raise ValueError("Gaussian-splat centers must have shape [N, 2] with N > 0")
+        count = int(centers.shape[0])
+        component_shapes = {
+            "centers": (count, 2),
+            "log_scales": (count, 2),
+            "angles": (count,),
+            "amplitudes": (count,),
+            "bias": (1,),
+        }
+
+        arrays: dict[str, np.ndarray] = {}
+        for component in required_components:
+            value = np.asarray(data[component])
+            if component == "bias":
+                if value.size != 1:
+                    raise ValueError("Gaussian-splat bias must be a scalar")
+                value = value.reshape(1)
+            if tuple(value.shape) != component_shapes[component]:
+                raise ValueError(
+                    f"Gaussian-splat {component} must have shape {list(component_shapes[component])}; "
+                    f"received {list(value.shape)}"
+                )
+            array = np.ascontiguousarray(value, dtype="<f4")
+            if not np.all(np.isfinite(array)):
+                raise ValueError(f"Gaussian-splat {component} must contain only finite values")
+            arrays[component] = array
+
+        splat_metadata = dict(metadata or {})
+        resolved_coordinate_space = str(
+            coordinate_space or splat_metadata.get("coordinate_space", "") or ""
+        ).strip().lower()
+        resolved_value_space = str(value_space or splat_metadata.get("value_space", "") or "").strip().lower()
+        if resolved_coordinate_space not in {"normalized", "physical"}:
+            raise ValueError("coordinate_space must be either 'normalized' or 'physical'")
+        if resolved_value_space not in {"normalized", "physical"}:
+            raise ValueError("value_space must be either 'normalized' or 'physical'")
+
+        resolved_coordinate_transform = (
+            coordinate_transform
+            if coordinate_transform is not None
+            else splat_metadata.get("coordinate_transform")
+        )
+        resolved_value_transform = (
+            value_transform if value_transform is not None else splat_metadata.get("value_transform")
+        )
+        if resolved_coordinate_space == "normalized" and not isinstance(resolved_coordinate_transform, dict):
+            raise ValueError("normalized Gaussian coordinates require coordinate_transform metadata")
+        if resolved_value_space == "normalized" and not isinstance(resolved_value_transform, dict):
+            raise ValueError("normalized Gaussian values require value_transform metadata")
+        if resolved_coordinate_transform is not None and not isinstance(resolved_coordinate_transform, dict):
+            raise TypeError("coordinate_transform must be a dictionary")
+        if resolved_value_transform is not None and not isinstance(resolved_value_transform, dict):
+            raise TypeError("value_transform must be a dictionary")
+        if resolved_coordinate_transform and not str(resolved_coordinate_transform.get("type", "") or "").strip():
+            raise ValueError("coordinate_transform requires a non-empty type")
+        if resolved_value_transform and not str(resolved_value_transform.get("type", "") or "").strip():
+            raise ValueError("value_transform requires a non-empty type")
+
+        component_records = []
+        payload_parts = []
+        offset = 0
+        for component in required_components:
+            array = arrays[component]
+            component_payload = array.tobytes(order="C")
+            component_records.append(
+                {
+                    "name": component,
+                    "shape": list(array.shape),
+                    "offset": offset,
+                    "length": len(component_payload),
+                }
+            )
+            payload_parts.append(component_payload)
+            offset += len(component_payload)
+
+        splat_metadata.update(
+            {
+                "format_version": 1,
+                "kind": "gaussianSplat",
+                "model": "anisotropic-2d-scalar",
+                "spatial_dimensions": 2,
+                "count": count,
+                "dtype": "float32",
+                "byte_order": "little",
+                "layout": "structure-of-arrays",
+                "encoding": "raw",
+                "compression": "none",
+                "scale_encoding": "log",
+                "angle_units": "radians",
+                "coordinate_order": ["x", "y"],
+                "kernel": "unnormalized-anisotropic-gaussian",
+                "rotation_convention": "u=dx*cos(angle)+dy*sin(angle);v=-dx*sin(angle)+dy*cos(angle)",
+                "reconstruction": "bias+sum(amplitude*exp(-0.5*((u/exp(log_scale_x))^2+(v/exp(log_scale_y))^2)))",
+                "coordinate_space": resolved_coordinate_space,
+                "coordinate_transform": resolved_coordinate_transform or {},
+                "value_space": resolved_value_space,
+                "value_transform": resolved_value_transform or {},
+                "components": component_records,
+                "payload_bytes": offset,
+            }
+        )
+        return b"".join(payload_parts), splat_metadata
+
     def _normalize_visualization_variable_specs(self, variables, source_dataset: str | None):
         if isinstance(variables, (str, dict, tuple)):
             variable_list = [variables]
@@ -878,10 +1121,84 @@ def _load_scalar_field_cli_input(args: argparse.Namespace) -> tuple[bytes | np.n
     return input_path.read_bytes(), metadata
 
 
-def _require_manifest_fields(manifest: dict, required_fields: tuple[str, ...]) -> None:
+def _load_gaussian_splat_cli_input(args: argparse.Namespace) -> tuple[dict[str, np.ndarray], dict]:
+    input_path = Path(args.file)
+    if input_path.suffix.lower() != ".npz":
+        raise ValueError("gaussian-splat CLI input must be a NumPy .npz file")
+    metadata = _load_json_object(args.metadata_json, "Gaussian-splat metadata") if args.metadata_json else {}
+    with np.load(input_path, allow_pickle=False) as archive:
+        required = ("centers", "log_scales", "angles", "amplitudes", "bias")
+        missing = [name for name in required if name not in archive]
+        if missing:
+            raise ValueError(f"Gaussian-splat .npz input is missing arrays: {', '.join(missing)}")
+        data = {name: np.asarray(archive[name]) for name in required}
+    return data, metadata
+
+
+def _require_manifest_fields(
+    manifest: dict,
+    required_fields: tuple[str, ...],
+    label: str = "manifest",
+) -> None:
     missing = [field for field in required_fields if field not in manifest]
     if missing:
-        raise ValueError(f"visualization sequence manifest is missing required field(s): {', '.join(missing)}")
+        raise ValueError(f"{label} is missing required field(s): {', '.join(missing)}")
+
+
+def _apply_representation_manifest(manager: Manager, manifest: dict, replace: bool = False) -> int:
+    _require_manifest_fields(manifest, ("name",), "representation manifest")
+    representation_name = str(manifest["name"])
+    representation_format = manifest.get("format", manifest.get("representation_format"))
+    sources = manifest.get("sources")
+    repid: int | str
+    if representation_format is not None or sources is not None:
+        _require_manifest_fields(manifest, ("sources",), "representation creation manifest")
+        if representation_format is None:
+            raise ValueError("representation creation manifest is missing required field: format")
+        repid = manager.create_representation(
+            name=representation_name,
+            representation_format=representation_format,
+            sources=sources,
+            field_name=manifest.get("field_name"),
+            temporal_interpolation=manifest.get("temporal_interpolation", "none"),
+            parameter_correspondence=manifest.get("parameter_correspondence"),
+            metadata=manifest.get("metadata"),
+            replace=bool(manifest.get("replace", False) or replace),
+        )
+    else:
+        if replace:
+            raise ValueError("--replace requires format and sources in the representation manifest")
+        repid = representation_name
+
+    for item in manifest.get("items", []):
+        if not isinstance(item, dict) or "dataset" not in item:
+            raise ValueError(f"Representation item requires dataset: {item!r}")
+        manager.append_representation_item(
+            representation=repid,
+            dataset=item["dataset"],
+            logical_time=item.get("logical_time"),
+            source_selections=item.get("source_selections"),
+            source_step=item.get("source_step"),
+            source_time=item.get("source_time"),
+            metrics=item.get("metrics"),
+            metadata=item.get("metadata"),
+            item_order=item.get("item_order"),
+        )
+
+    for metric in manifest.get("metrics", []):
+        if not isinstance(metric, dict):
+            raise ValueError(f"Representation metric must be an object: {metric!r}")
+        _require_manifest_fields(metric, ("name", "value"), "representation metric")
+        manager.add_representation_metric(
+            representation=repid,
+            name=metric["name"],
+            value=metric["value"],
+            units=metric.get("units"),
+            norm=metric.get("norm"),
+            relative=bool(metric.get("relative", False)),
+            metadata=metric.get("metadata"),
+        )
+    return int(repid) if isinstance(repid, int) else -1
 
 
 # pylint:disable = too-many-statements
@@ -904,6 +1221,7 @@ def main(args=None, prog=None):
         create_allowed = True
         if parser.args.command in (
             "info",
+            "representation",
             "visualization-sequence",
             "add-archival-storage",
             "archived-replica",
@@ -945,9 +1263,26 @@ def main(args=None, prog=None):
                 encoding=parser.args.encoding,
                 replica_name=parser.args.replica_name,
             )
+        elif parser.args.command == "gaussian-splat":
+            splat_data, splat_metadata = _load_gaussian_splat_cli_input(parser.args)
+            manager.gaussian_splat_data(
+                splat_data,
+                name=parser.args.name,
+                metadata=splat_metadata,
+                coordinate_space=parser.args.coordinate_space,
+                value_space=parser.args.value_space,
+                replica_name=parser.args.replica_name,
+            )
+        elif parser.args.command == "representation":
+            manifest = _load_json_object(parser.args.manifest, "representation manifest")
+            _apply_representation_manifest(manager, manifest, replace=parser.args.replace)
         elif parser.args.command == "visualization-sequence":
             manifest = _load_json_object(parser.args.manifest, "visualization sequence manifest")
-            _require_manifest_fields(manifest, ("name", "vis_type", "variables", "items"))
+            _require_manifest_fields(
+                manifest,
+                ("name", "vis_type", "variables", "items"),
+                "visualization sequence manifest",
+            )
             manager.visualization_sequence(
                 name=manifest["name"],
                 vis_type=manifest["vis_type"],

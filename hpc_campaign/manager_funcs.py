@@ -31,6 +31,11 @@ from PIL import Image
 
 from .config import ACA_VERSION
 from .hdf5_metadata import copy_hdf5_file_without_data, is_hdf5_dataset
+from .representations import (
+    GAUSSIAN_SPLAT_FORMAT,
+    SCALAR_FIELD_FORMAT,
+    ensure_representation_tables,
+)
 from .taridx import TARTYPES
 from .utils import (
     CURRENT_TIME,
@@ -42,22 +47,9 @@ from .utils import (
     sql_execute,
 )
 
-SCALAR_FIELD_FORMAT = "SCALAR_FIELD"
 SCALAR_FIELD_KIND = "scalarField"
-SCALAR_FIELD_SEQUENCE_COMPATIBILITY_KEYS = (
-    "rank",
-    "shape",
-    "dtype",
-    "byte_order",
-    "layout",
-    "encoding",
-    "compression",
-    "value_encoding",
-)
-SUPPORTED_VISUALIZATION_ITEM_FORMATS = {
-    "IMAGE": "IMAGE",
-    SCALAR_FIELD_FORMAT: SCALAR_FIELD_FORMAT,
-}
+GAUSSIAN_SPLAT_KIND = "gaussianSplat"
+SUPPORTED_VISUALIZATION_ITEM_FORMATS = {"IMAGE": "IMAGE"}
 
 
 def find_host_def(args: argparse.Namespace, hostname: str) -> dict | str | None:
@@ -376,6 +368,14 @@ def ensure_scalar_field_tables(cur: sqlite3.Cursor, con: sqlite3.Connection):
     sql_commit(con)
 
 
+def ensure_gaussian_splat_tables(cur: sqlite3.Cursor, con: sqlite3.Connection):
+    sql_execute(
+        cur,
+        "create table if not exists gaussian_splat" + "(datasetid INT PRIMARY KEY, metadata TEXT)",
+    )
+    sql_commit(con)
+
+
 def add_scalar_field_metadata_to_archive(
     datasetid: int,
     metadata: dict,
@@ -395,55 +395,22 @@ def add_scalar_field_metadata_to_archive(
     return row_id
 
 
-def _scalar_field_metadata_for_dataset(cur: sqlite3.Cursor, datasetid: int, dataset_name: str) -> dict:
-    res = sql_execute(cur, "select metadata from scalar_field where datasetid = ?", (datasetid,))
-    row = res.fetchone()
-    if row is None or not row[0]:
-        raise ValueError(f"SCALAR_FIELD dataset is missing scalar metadata: {dataset_name}")
-    try:
-        metadata = json.loads(row[0])
-    except Exception as exc:
-        raise ValueError(f"SCALAR_FIELD dataset has invalid scalar metadata: {dataset_name}") from exc
-    if not isinstance(metadata, dict):
-        raise ValueError(f"SCALAR_FIELD dataset metadata must be a JSON object: {dataset_name}")
-    return metadata
-
-
-def _scalar_field_sequence_signature(metadata: dict, dataset_name: str) -> tuple:
-    try:
-        shape = metadata.get("shape", [])
-        if not isinstance(shape, list) or len(shape) != 2:
-            raise ValueError
-        rank = int(metadata.get("rank", len(shape)))
-        shape_tuple = (int(shape[0]), int(shape[1]))
-        dtype = str(metadata.get("dtype", "") or "").strip()
-        byte_order = str(metadata.get("byte_order", "") or "").strip().lower()
-        layout = str(metadata.get("layout", "") or "").strip().lower()
-        encoding = str(metadata.get("encoding", "") or "").strip().lower()
-        compression = str(metadata.get("compression", "") or "").strip().lower()
-        value_encoding = str(metadata.get("value_encoding", "") or "").strip().lower()
-    except Exception as exc:
-        raise ValueError(f"SCALAR_FIELD dataset has invalid shape/rank metadata: {dataset_name}") from exc
-
-    normalized = {
-        "rank": rank,
-        "shape": shape_tuple,
-        "dtype": dtype,
-        "byte_order": byte_order,
-        "layout": layout,
-        "encoding": encoding,
-        "compression": compression,
-        "value_encoding": value_encoding,
-    }
-    missing = [key for key, value in normalized.items() if value in {"", ()}]
-    if missing:
-        raise ValueError(f"SCALAR_FIELD dataset metadata is missing {', '.join(missing)}: {dataset_name}")
-    if rank != 2:
-        raise ValueError(f"SCALAR_FIELD visualization items must be rank 2: {dataset_name}")
-    if shape_tuple[0] <= 0 or shape_tuple[1] <= 0:
-        raise ValueError(f"SCALAR_FIELD visualization item shape dimensions must be positive: {dataset_name}")
-
-    return tuple(normalized[key] for key in SCALAR_FIELD_SEQUENCE_COMPATIBILITY_KEYS)
+def add_gaussian_splat_metadata_to_archive(
+    datasetid: int,
+    metadata: dict,
+    cur: sqlite3.Cursor,
+    indent: str = "",
+    verbose: bool = True,
+) -> int:
+    if verbose:
+        print(f"{indent}Add Gaussian-splat metadata for dataset {datasetid} to archive")
+    cur_ds = sql_execute(
+        cur,
+        "insert into gaussian_splat (datasetid, metadata) values (?, ?) "
+        "on conflict (datasetid) do update set metadata = excluded.metadata returning rowid",
+        (datasetid, json.dumps(metadata, sort_keys=True)),
+    )
+    return int(cur_ds.fetchone()[0])
 
 
 def ensure_visualization_tables(cur: sqlite3.Cursor, con: sqlite3.Connection):
@@ -631,34 +598,19 @@ def add_visualization_sequence(  # pylint: disable=too-many-statements
             raise ValueError(f"thumbnail_name must refer to an IMAGE dataset, not {thumb_fileformat}")
 
     resolved_items: list[dict[str, str | None]] = []
-    scalar_field_signature = None
-    scalar_field_signature_name = ""
     for item_spec in item_specs:
         item_uuid = item_spec["uuid"]
         item_name = item_spec["name"]
         if item_uuid:
-            item_id, resolved_name, item_fileformat = _resolve_live_dataset_by_uuid(cur, str(item_uuid))
+            _item_id, _resolved_name, item_fileformat = _resolve_live_dataset_by_uuid(cur, str(item_uuid))
         else:
-            item_id, item_uuid, item_fileformat = _resolve_live_dataset(cur, str(item_name))
-            resolved_name = str(item_name)
+            _item_id, item_uuid, item_fileformat = _resolve_live_dataset(cur, str(item_name))
         expected_format = SUPPORTED_VISUALIZATION_ITEM_FORMATS[str(item_spec["type"])]
         if item_fileformat != expected_format:
             raise ValueError(
                 f"Visualization item type {item_spec['type']} must refer to a {expected_format} dataset, "
                 f"not {item_fileformat}"
             )
-        if expected_format == SCALAR_FIELD_FORMAT:
-            scalar_metadata = _scalar_field_metadata_for_dataset(cur, item_id, resolved_name)
-            signature = _scalar_field_sequence_signature(scalar_metadata, resolved_name)
-            if scalar_field_signature is None:
-                scalar_field_signature = signature
-                scalar_field_signature_name = resolved_name
-            elif signature != scalar_field_signature:
-                raise ValueError(
-                    "All SCALAR_FIELD items in a visualization sequence must have compatible metadata "
-                    f"(rank, shape, dtype, byte order, layout, encoding, compression, value encoding). "
-                    f"First item: {scalar_field_signature_name}; mismatched item: {resolved_name}"
-                )
         resolved_items.append(
             {
                 "type": str(item_spec["type"]),
@@ -1086,12 +1038,83 @@ def process_scalar_field_data(
         indent="  ",
         verbose=verbose,
     )
-    add_resolution_to_archive(rep_id, width, height, cur, indent="  ", verbose=verbose)
     add_scalar_field_metadata_to_archive(ds_id, metadata, cur, indent="  ", verbose=verbose)
 
     safe_dtype = re.sub(r"[^A-Za-z0-9_.-]+", "_", dtype)
     resname = f"{width}x{height}.{safe_dtype}.raw"
     add_file_to_archive(args, "", cur, rep_id, mt, resname, compress=False, content=payload, indent="  ")
+
+
+def process_gaussian_splat_data(
+    args: argparse.Namespace,
+    cur: sqlite3.Cursor,
+    host_id: int,
+    dir_id: int,
+    key_id: int,
+    dirpath: str,
+    location: str,
+):
+    payload = bytes(args.gaussian_splat_data)
+    metadata = dict(getattr(args, "gaussian_splat_metadata", {}) or {})
+    if not payload:
+        raise ValueError("gaussian_splat_data requires a non-empty payload")
+    if metadata.get("kind") != GAUSSIAN_SPLAT_KIND:
+        raise ValueError(f"gaussian_splat_data metadata.kind must be {GAUSSIAN_SPLAT_KIND!r}")
+    if str(metadata.get("encoding", "") or "").lower() != "raw":
+        raise ValueError("Only raw Gaussian-splat encoding is supported currently")
+    if str(metadata.get("compression", "") or "").lower() != "none":
+        raise ValueError("Only uncompressed Gaussian-splat payloads are supported currently")
+    if str(metadata.get("dtype", "") or "").lower() != "float32":
+        raise ValueError("Only float32 Gaussian-splat payloads are supported currently")
+    if int(metadata.get("spatial_dimensions", 0)) != 2:
+        raise ValueError("gaussian_splat_data requires spatial_dimensions=2")
+    count = int(metadata.get("count", 0))
+    if count <= 0:
+        raise ValueError("gaussian_splat_data metadata.count must be positive")
+    expected_bytes = (6 * count + 1) * 4
+    if len(payload) != expected_bytes:
+        raise ValueError(f"Gaussian-splat payload has {len(payload)} bytes; expected {expected_bytes}")
+
+    if args.name is not None:
+        dataset = args.name
+        unique_id = uuid.uuid3(uuid.NAMESPACE_URL, location + "/" + dataset).hex
+    else:
+        checksum = sha1(payload + json.dumps(metadata, sort_keys=True).encode("utf-8")).hexdigest()
+        unique_id = uuid.uuid5(uuid.NAMESPACE_OID, checksum).hex
+        dataset = f"memory-gaussian-splats/splat-{unique_id[:12]}.raw"
+
+    replica_name = getattr(args, "replica_name", "") or join("memory-gaussian-splats", f"{unique_id}.raw")
+    mt = time_ns()
+    verbose = is_verbose(args)
+    if verbose:
+        print(f"Process in-memory Gaussian splat {dataset}")
+
+    ds_id = add_dataset_to_archive(dataset, cur, unique_id, GAUSSIAN_SPLAT_FORMAT, mt, indent="  ", verbose=verbose)
+    rep_id = add_replica_to_archive(
+        host_id,
+        dir_id,
+        0,
+        key_id,
+        replica_name,
+        cur,
+        ds_id,
+        mt,
+        len(payload),
+        indent="  ",
+        verbose=verbose,
+    )
+    add_gaussian_splat_metadata_to_archive(ds_id, metadata, cur, indent="  ", verbose=verbose)
+    add_file_to_archive(
+        args,
+        "",
+        cur,
+        rep_id,
+        mt,
+        f"{count}.float32.raw",
+        compress=False,
+        content=payload,
+        indent="  ",
+    )
 
 
 def add_image_data(args: argparse.Namespace, cur: sqlite3.Cursor, con: sqlite3.Connection):
@@ -1120,6 +1143,21 @@ def add_scalar_field_data(args: argparse.Namespace, cur: sqlite3.Cursor, con: sq
     sql_commit(con)
 
     process_scalar_field_data(args, cur, host_id, dir_id, key_id, long_host_name + rootdir, rootdir)
+    sql_commit(con)
+
+
+def add_gaussian_splat_data(args: argparse.Namespace, cur: sqlite3.Cursor, con: sqlite3.Connection):
+    ensure_gaussian_splat_tables(cur, con)
+    long_host_name, short_host_name = get_host_name(args)
+    verbose = is_verbose(args)
+
+    host_id = add_host_name(long_host_name, short_host_name, cur, verbose=verbose)
+    key_id = add_key_id(args.encryption_key_id, cur, verbose=verbose)
+    rootdir = getcwd()
+    dir_id = add_directory(host_id, rootdir, cur, verbose=verbose)
+    sql_commit(con)
+
+    process_gaussian_splat_data(args, cur, host_id, dir_id, key_id, long_host_name + rootdir, rootdir)
     sql_commit(con)
 
 
@@ -1752,6 +1790,8 @@ def create_tables(campaign_file_name: str, con: sqlite3.Connection):
     )
     ensure_visualization_tables(cur, con)
     ensure_scalar_field_tables(cur, con)
+    ensure_gaussian_splat_tables(cur, con)
+    ensure_representation_tables(cur, con)
     sql_execute(
         cur,
         "create table archiveidx"

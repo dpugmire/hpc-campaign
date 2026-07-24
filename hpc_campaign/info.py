@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 
 from .utils import sizeof_fmt, sql_execute, timestamp_to_str
 
+# pylint: disable=too-many-lines
+
 
 @dataclass
 class ArchiveInfo:
@@ -161,6 +163,61 @@ class VisualizationSequenceInfo:  # pylint: disable=too-many-instance-attributes
 
 
 @dataclass
+class RepresentationSourceInfo:
+    """Ground-truth variable used to produce a representation."""
+
+    id: int
+    dataset_id: int
+    dataset_name: str
+    variable_name: str
+    label: str
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class RepresentationMetricInfo:
+    """Named per-item or aggregate representation accuracy metric."""
+
+    name: str
+    value: float
+    units: str | None
+    norm: str | None
+    relative: bool
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class RepresentationItemInfo:  # pylint: disable=too-many-instance-attributes
+    """One independently addressable item or timestep in a representation."""
+
+    id: int
+    item_order: int
+    dataset_id: int
+    dataset_name: str
+    dataset_uuid: str
+    file_format: str
+    logical_time: float | None
+    metadata: dict = field(default_factory=dict)
+    source_selections: dict[str, dict] = field(default_factory=dict)
+    metrics: list[RepresentationMetricInfo] = field(default_factory=list)
+
+
+@dataclass
+class RepresentationInfo:  # pylint: disable=too-many-instance-attributes
+    """Alternate scalar-data representation and its provenance."""
+
+    name: str
+    field_name: str
+    representation_format: str
+    temporal_interpolation: str
+    parameter_correspondence: str
+    metadata: dict = field(default_factory=dict)
+    sources: dict[int, RepresentationSourceInfo] = field(default_factory=dict)
+    items: list[RepresentationItemInfo] = field(default_factory=list)
+    metrics: list[RepresentationMetricInfo] = field(default_factory=list)
+
+
+@dataclass
 class InfoResult:
     """Aggregated archive information."""
 
@@ -169,6 +226,7 @@ class InfoResult:
     keys: list[KeyInfo] = field(default_factory=list)
     time_series: dict[int, TimeSeriesInfo] = field(default_factory=dict)
     visualization_sequences: dict[int, VisualizationSequenceInfo] = field(default_factory=dict)
+    representations: dict[int, RepresentationInfo] = field(default_factory=dict)
     datasets: dict[int, DatasetInfo] = field(default_factory=dict)
 
 
@@ -332,8 +390,6 @@ SELECT
     f.modtime           AS file_modtime,
     f.checksum          AS checksum,
 
-    res.x               AS res_x,
-    res.y               AS res_y,
     sf.metadata         AS scalar_metadata
 
 FROM dataset AS d
@@ -343,11 +399,53 @@ LEFT JOIN repfiles AS rf
     ON rf.replicaid = r.rowid
 LEFT JOIN file AS f
     ON f.fileid = rf.fileid
-LEFT JOIN resolution AS res
-    ON res.replicaid = r.rowid
 LEFT JOIN scalar_field AS sf
     ON sf.datasetid = d.rowid
 WHERE d.fileformat = 'SCALAR_FIELD'
+ORDER BY d.rowid, r.rowid, f.fileid;
+"""
+
+SELECT_GAUSSIAN_SPLATS_CMD = """
+SELECT
+    d.rowid             AS ds_id,
+    d.name              AS ds_name,
+    d.uuid              AS ds_uuid,
+    d.modtime           AS ds_modtime,
+    d.deltime           AS ds_deltime,
+    d.fileformat        AS ds_fileformat,
+    d.tsid              AS ds_tsid,
+
+    r.rowid             AS rep_id,
+    r.hostid            AS hostid,
+    r.dirid             AS dirid,
+    r.archiveid         AS archiveid,
+    r.name              AS rep_name,
+    r.modtime           AS rep_modtime,
+    r.deltime           AS rep_deltime,
+    r.keyid             AS keyid,
+    r.size              AS rep_size,
+
+    rf.fileid           AS repfile_id,
+
+    f.name              AS file_name,
+    f.compression       AS compression,
+    f.lenorig           AS lenorig,
+    f.lencompressed     AS lencompressed,
+    f.modtime           AS file_modtime,
+    f.checksum          AS checksum,
+
+    gs.metadata         AS gaussian_splat_metadata
+
+FROM dataset AS d
+JOIN replica AS r
+    ON r.datasetid = d.rowid
+LEFT JOIN repfiles AS rf
+    ON rf.replicaid = r.rowid
+LEFT JOIN file AS f
+    ON f.fileid = rf.fileid
+LEFT JOIN gaussian_splat AS gs
+    ON gs.datasetid = d.rowid
+WHERE d.fileformat = 'GAUSSIAN_SPLAT'
 ORDER BY d.rowid, r.rowid, f.fileid;
 """
 
@@ -502,16 +600,13 @@ def info_scalar_fields(  # pylint: disable=too-many-locals
 
     res = sql_execute(cur, SELECT_SCALAR_FIELDS_CMD)
     for row in res:
-        resolution = None
-        if row["res_x"] is not None and row["res_y"] is not None:
-            resolution = ResolutionInfo(int(row["res_x"]), int(row["res_y"]))
         dataset_info = info_row(
             args,
             info_data,
             row,
             accuracy=False,
             embedded=(row["repfile_id"] is not None),
-            resolution=resolution,
+            resolution=None,
             dirs_archived=dirs_archived,
         )
         if dataset_info is None:
@@ -519,6 +614,37 @@ def info_scalar_fields(  # pylint: disable=too-many-locals
         if row["scalar_metadata"]:
             try:
                 metadata = json.loads(row["scalar_metadata"])
+                dataset_info.metadata = metadata if isinstance(metadata, dict) else None
+            except (json.JSONDecodeError, TypeError):
+                dataset_info.metadata = None
+
+
+def info_gaussian_splats(  # pylint: disable=too-many-locals
+    args: argparse.Namespace,
+    info_data: InfoResult,
+    cur: sqlite3.Cursor,
+    dirs_archived: dict[int, bool],
+):
+    res_tables = sql_execute(cur, "select name from sqlite_master where type = 'table' and name = 'gaussian_splat'")
+    if res_tables.fetchone() is None:
+        return
+
+    res = sql_execute(cur, SELECT_GAUSSIAN_SPLATS_CMD)
+    for row in res:
+        dataset_info = info_row(
+            args,
+            info_data,
+            row,
+            accuracy=False,
+            embedded=(row["repfile_id"] is not None),
+            resolution=None,
+            dirs_archived=dirs_archived,
+        )
+        if dataset_info is None:
+            continue
+        if row["gaussian_splat_metadata"]:
+            try:
+                metadata = json.loads(row["gaussian_splat_metadata"])
                 dataset_info.metadata = metadata if isinstance(metadata, dict) else None
             except (json.JSONDecodeError, TypeError):
                 dataset_info.metadata = None
@@ -544,6 +670,135 @@ def info_texts(  # pylint: disable=too-many-locals
             resolution=None,
             dirs_archived=dirs_archived,
         )
+
+
+def _info_json_object(value: str | None) -> dict:
+    if not value:
+        return {}
+    try:
+        result = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return result if isinstance(result, dict) else {}
+
+
+def info_representations(info_data: InfoResult, cur: sqlite3.Cursor) -> None:  # pylint: disable=too-many-locals
+    required_tables = {
+        "representation",
+        "representation_source",
+        "representation_item",
+        "representation_item_source",
+        "representation_metric",
+    }
+    rows = sql_execute(
+        cur,
+        "select name from sqlite_master where type = 'table' and name in "
+        "('representation', 'representation_source', 'representation_item', "
+        "'representation_item_source', 'representation_metric')",
+    ).fetchall()
+    if {str(row[0]) for row in rows} != required_tables:
+        return
+
+    representation_rows = sql_execute(
+        cur,
+        "select repid, name, field_name, format, temporal_interpolation, "
+        "parameter_correspondence, metadata from representation order by repid",
+    )
+    for row in representation_rows:
+        repid = int(row["repid"])
+        info_data.representations[repid] = RepresentationInfo(
+            name=str(row["name"]),
+            field_name=str(row["field_name"]),
+            representation_format=str(row["format"]),
+            temporal_interpolation=str(row["temporal_interpolation"]),
+            parameter_correspondence=str(row["parameter_correspondence"]),
+            metadata=_info_json_object(row["metadata"]),
+        )
+
+    sources_by_id: dict[int, tuple[int, RepresentationSourceInfo]] = {}
+    source_rows = sql_execute(
+        cur,
+        "select rs.sourceid, rs.repid, rs.datasetid, d.name as dataset_name, "
+        "rs.variable_name, rs.label, rs.metadata "
+        "from representation_source as rs join dataset as d on d.rowid = rs.datasetid "
+        "order by rs.repid, rs.sourceid",
+    )
+    for row in source_rows:
+        repid = int(row["repid"])
+        representation = info_data.representations.get(repid)
+        if representation is None:
+            continue
+        source = RepresentationSourceInfo(
+            id=int(row["sourceid"]),
+            dataset_id=int(row["datasetid"]),
+            dataset_name=str(row["dataset_name"]),
+            variable_name=str(row["variable_name"]),
+            label=str(row["label"]),
+            metadata=_info_json_object(row["metadata"]),
+        )
+        representation.sources[source.id] = source
+        sources_by_id[source.id] = (repid, source)
+
+    items_by_id: dict[int, tuple[int, RepresentationItemInfo]] = {}
+    item_rows = sql_execute(
+        cur,
+        "select ri.itemid, ri.repid, ri.item_order, ri.datasetid, ri.logical_time, ri.metadata, "
+        "d.name as dataset_name, d.uuid as dataset_uuid, d.fileformat as file_format "
+        "from representation_item as ri join dataset as d on d.rowid = ri.datasetid "
+        "order by ri.repid, ri.item_order",
+    )
+    for row in item_rows:
+        repid = int(row["repid"])
+        representation = info_data.representations.get(repid)
+        if representation is None:
+            continue
+        item = RepresentationItemInfo(
+            id=int(row["itemid"]),
+            item_order=int(row["item_order"]),
+            dataset_id=int(row["datasetid"]),
+            dataset_name=str(row["dataset_name"]),
+            dataset_uuid=str(row["dataset_uuid"]),
+            file_format=str(row["file_format"]),
+            logical_time=float(row["logical_time"]) if row["logical_time"] is not None else None,
+            metadata=_info_json_object(row["metadata"]),
+        )
+        representation.items.append(item)
+        items_by_id[item.id] = (repid, item)
+
+    selection_rows = sql_execute(
+        cur,
+        "select ris.itemid, ris.sourceid, ris.selection "
+        "from representation_item_source as ris order by ris.itemid, ris.sourceid",
+    )
+    for row in selection_rows:
+        item_record = items_by_id.get(int(row["itemid"]))
+        source_record = sources_by_id.get(int(row["sourceid"]))
+        if item_record is None or source_record is None or item_record[0] != source_record[0]:
+            continue
+        item_record[1].source_selections[source_record[1].label] = _info_json_object(row["selection"])
+
+    metric_rows = sql_execute(
+        cur,
+        "select repid, itemid, name, value, units, norm, relative, metadata "
+        "from representation_metric order by repid, metricid",
+    )
+    for row in metric_rows:
+        metric = RepresentationMetricInfo(
+            name=str(row["name"]),
+            value=float(row["value"]),
+            units=str(row["units"]) if row["units"] is not None else None,
+            norm=str(row["norm"]) if row["norm"] is not None else None,
+            relative=bool(row["relative"]),
+            metadata=_info_json_object(row["metadata"]),
+        )
+        if row["itemid"] is None:
+            representation = info_data.representations.get(int(row["repid"]))
+            if representation is not None:
+                representation.metrics.append(metric)
+        else:
+            item_record = items_by_id.get(int(row["itemid"]))
+            if item_record is not None:
+                item_record[1].metrics.append(metric)
 
 
 def collect_info(  # pylint: disable=too-many-locals,too-many-statements
@@ -662,6 +917,7 @@ def collect_info(  # pylint: disable=too-many-locals,too-many-statements
         info_texts(args, info_datasets, cur, dirs_archived)
         info_images(args, info_datasets, cur, dirs_archived)
         info_scalar_fields(args, info_datasets, cur, dirs_archived)
+        info_gaussian_splats(args, info_datasets, cur, dirs_archived)
 
     res_tables = sql_execute(
         cur,
@@ -740,6 +996,7 @@ def collect_info(  # pylint: disable=too-many-locals,too-many-statements
                 )
             )
 
+    info_representations(info_datasets, cur)
     return info_datasets
 
 
@@ -769,7 +1026,7 @@ def format_info_dataset_lines(  # pylint: disable=too-many-locals
         else:
             replica_line += "  "
 
-        if dataset_info.file_format in {"IMAGE", "SCALAR_FIELD"} and replica_info.resolution is not None:
+        if dataset_info.file_format == "IMAGE" and replica_info.resolution is not None:
             res = replica_info.resolution
             resolution_text = f" {res.x} x {res.y}".rjust(14)
         else:
@@ -837,6 +1094,40 @@ def format_info(info_data: InfoResult) -> str:  # pylint: disable=too-many-state
             lines.extend(format_info_dataset_lines(dataset_info))
         lines.append("")
 
+    if info_data.representations:
+        lines.append("Data Representations:")
+        for _representation_id, representation in sorted(info_data.representations.items()):
+            lines.append(
+                f"  {representation.name}   field={representation.field_name} "
+                f"format={representation.representation_format}"
+            )
+            lines.append(
+                f"      temporal interpolation: {representation.temporal_interpolation}; "
+                f"parameter correspondence: {representation.parameter_correspondence}"
+            )
+            for source in representation.sources.values():
+                lines.append(
+                    f"      source {source.label}: {source.variable_name} "
+                    f"(dataset {source.dataset_name})"
+                )
+            lines.append(f"      items: {len(representation.items)}")
+            for item in representation.items[:3]:
+                time_text = f" time={item.logical_time:g}" if item.logical_time is not None else ""
+                lines.append(
+                    f"      item[{item.item_order}]: {item.dataset_name} ({item.file_format}){time_text}"
+                )
+                for label, selection in sorted(item.source_selections.items()):
+                    lines.append(f"          {label}: {json.dumps(selection, sort_keys=True)}")
+                for metric in item.metrics:
+                    lines.append(f"          metric {metric.name}: {metric.value:g}")
+            if len(representation.items) > 3:
+                lines.append(f"      ... {len(representation.items) - 3} more item(s)")
+            for metric in representation.metrics:
+                lines.append(f"      aggregate metric {metric.name}: {metric.value:g}")
+            if representation.metadata:
+                lines.append(f"      metadata: {json.dumps(representation.metadata, sort_keys=True)}")
+        lines.append("")
+
     if info_data.visualization_sequences:
         lines.append("Visualization Sequences:")
         for _vis_id, sequence_info in sorted(info_data.visualization_sequences.items()):
@@ -895,9 +1186,7 @@ def _format_visualization_metadata(metadata: str | None) -> str | None:
 def format_image_associations(info_data: InfoResult) -> str:
     lines = []
     sequences = list(info_data.visualization_sequences.values())
-    image_datasets = [
-        dataset for dataset in _collect_all_datasets(info_data) if dataset.file_format in {"IMAGE", "SCALAR_FIELD"}
-    ]
+    image_datasets = [dataset for dataset in _collect_all_datasets(info_data) if dataset.file_format == "IMAGE"]
 
     for dataset in image_datasets:
         lines.append(f"{dataset.name}: {dataset.file_format}")

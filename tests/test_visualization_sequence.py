@@ -88,29 +88,29 @@ def test_manager_info_images_flag_is_parsed():
     assert parser.args.images is True
 
 
-def test_scalar_field_visualization_sequence(tmp_path: Path):
-    archive_name = "scalar_field_visualization.aca"
+def test_scalar_field_data_representation(tmp_path: Path):
+    archive_name = "scalar_field_representation.aca"
     field = np.arange(12, dtype=np.float32).reshape(3, 4)
 
     manager = Manager(archive=archive_name, campaign_store=str(tmp_path))
     manager.open(create=True, truncate=True)
     manager.data(str(data_dir / "onearray.h5"), name="output")
-    manager.scalar_field_data(field, name="output/visualizations/temp/scalar.000000.raw")
+    dataset_name = "output/representations/temp/scalar.000000.raw"
+    manager.scalar_field_data(field, name=dataset_name)
 
-    visid = manager.visualization_sequence(
-        name="output/visualizations/temp",
-        vis_type="heatmap",
-        source_dataset="output",
-        variables=[{"name": "temp", "role": "primary"}],
-        items=[{"type": "SCALAR_FIELD", "name": "output/visualizations/temp/scalar.000000.raw"}],
-        metadata={"colormap": "viridis"},
+    repid = manager.create_representation(
+        name="output/representations/temp/scalar",
+        representation_format="SCALAR_FIELD",
+        sources=[{"dataset": "output", "variable": "temp"}],
+        temporal_interpolation="linear",
     )
+    manager.append_representation_item(repid, dataset_name, source_step=0, source_time=0.0)
 
-    assert visid > 0
+    assert repid > 0
 
     info_data = manager.info(list_replicas=True, list_files=True)
     scalar_dataset = next(dataset for dataset in info_data.datasets.values() if dataset.file_format == "SCALAR_FIELD")
-    assert scalar_dataset.name == "output/visualizations/temp/scalar.000000.raw"
+    assert scalar_dataset.name == dataset_name
     assert scalar_dataset.metadata is not None
     assert scalar_dataset.metadata["kind"] == "scalarField"
     assert scalar_dataset.metadata["shape"] == [3, 4]
@@ -120,15 +120,18 @@ def test_scalar_field_visualization_sequence(tmp_path: Path):
     assert scalar_dataset.metadata["min"] == 0.0
     assert scalar_dataset.metadata["max"] == 11.0
 
-    sequence_info = next(iter(info_data.visualization_sequences.values()))
-    assert sequence_info.items[0].item_type == "SCALAR_FIELD"
-    assert sequence_info.items[0].dataset_name == scalar_dataset.name
-    assert sequence_info.items[0].file_format == "SCALAR_FIELD"
+    representation = info_data.representations[repid]
+    assert representation.name == "output/representations/temp/scalar"
+    assert representation.field_name == "temp"
+    assert representation.representation_format == "SCALAR_FIELD"
+    assert representation.items[0].dataset_name == scalar_dataset.name
+    assert representation.items[0].source_selections == {"temp": {"step": 0, "time": 0.0}}
 
     assoc_text = format_image_associations(info_data)
-    assert "output/visualizations/temp/scalar.000000.raw: SCALAR_FIELD" in assoc_text
-    assert "sequence: output/visualizations/temp" in assoc_text
-    assert "variables: primary=temp@output" in assoc_text
+    assert dataset_name not in assoc_text
+    output_text = format_info(info_data)
+    assert "Data Representations:" in output_text
+    assert "field=temp format=SCALAR_FIELD" in output_text
 
     manager.close()
 
@@ -192,8 +195,8 @@ def test_scalar_field_data_bytes_require_shape_and_dtype(tmp_path: Path):
     manager.close()
 
 
-def test_scalar_field_sequence_rejects_mismatched_shape_or_dtype(tmp_path: Path):
-    archive_name = "scalar_field_sequence_mismatch.aca"
+def test_scalar_field_representation_rejects_mismatched_shape_or_dtype(tmp_path: Path):
+    archive_name = "scalar_field_representation_mismatch.aca"
     manager = Manager(archive=archive_name, campaign_store=str(tmp_path))
     manager.open(create=True, truncate=True)
     manager.data(str(data_dir / "onearray.h5"), name="output")
@@ -206,39 +209,39 @@ def test_scalar_field_sequence_rejects_mismatched_shape_or_dtype(tmp_path: Path)
         np.arange(6, dtype=np.float32).reshape(3, 2),
         name="output/visualizations/temp/scalar.000001.raw",
     )
-    with pytest.raises(ValueError, match="compatible metadata"):
-        manager.visualization_sequence(
-            name="output/visualizations/temp_shape",
-            vis_type="heatmap",
-            source_dataset="output",
-            variables=[{"name": "temp", "role": "primary"}],
-            items=[
-                {"type": "SCALAR_FIELD", "name": "output/visualizations/temp/scalar.000000.raw"},
-                {"type": "SCALAR_FIELD", "name": "output/visualizations/temp/scalar.000001.raw"},
-            ],
+    repid = manager.create_representation(
+        name="output/representations/temp_shape",
+        representation_format="SCALAR_FIELD",
+        sources=[{"dataset": "output", "variable": "temp"}],
+    )
+    manager.append_representation_item(
+        repid,
+        "output/visualizations/temp/scalar.000000.raw",
+        source_step=0,
+    )
+    with pytest.raises(ValueError, match="not compatible"):
+        manager.append_representation_item(
+            repid,
+            "output/visualizations/temp/scalar.000001.raw",
+            source_step=1,
         )
 
     manager.scalar_field_data(
         np.arange(6, dtype=np.float64).reshape(2, 3),
         name="output/visualizations/temp/scalar.000002.raw",
     )
-    with pytest.raises(ValueError, match="compatible metadata"):
-        manager.visualization_sequence(
-            name="output/visualizations/temp_dtype",
-            vis_type="heatmap",
-            source_dataset="output",
-            variables=[{"name": "temp", "role": "primary"}],
-            items=[
-                {"type": "SCALAR_FIELD", "name": "output/visualizations/temp/scalar.000000.raw"},
-                {"type": "SCALAR_FIELD", "name": "output/visualizations/temp/scalar.000002.raw"},
-            ],
+    with pytest.raises(ValueError, match="not compatible"):
+        manager.append_representation_item(
+            repid,
+            "output/visualizations/temp/scalar.000002.raw",
+            source_step=2,
         )
 
     manager.close()
 
 
-def test_visualization_sequence_rejects_mixed_item_types(tmp_path: Path):
-    archive_name = "visualization_mixed_items.aca"
+def test_visualization_sequence_rejects_data_representation_items(tmp_path: Path):
+    archive_name = "visualization_data_representation_item.aca"
     image_path = tmp_path / "thumb.png"
     Image.new("RGB", (8, 8), color="green").save(image_path)
 
@@ -251,16 +254,13 @@ def test_visualization_sequence_rejects_mixed_item_types(tmp_path: Path):
         name="output/visualizations/temp/scalar.000000.raw",
     )
 
-    with pytest.raises(ValueError, match="mixed item types are not supported"):
+    with pytest.raises(ValueError, match="Unsupported visualization item type: SCALAR_FIELD"):
         manager.visualization_sequence(
-            name="output/visualizations/mixed",
+            name="output/visualizations/invalid",
             vis_type="heatmap",
             source_dataset="output",
             variables=[{"name": "temp", "role": "primary"}],
-            items=[
-                {"type": "IMAGE", "name": "thumb"},
-                {"type": "SCALAR_FIELD", "name": "output/visualizations/temp/scalar.000000.raw"},
-            ],
+            items=[{"type": "SCALAR_FIELD", "name": "output/visualizations/temp/scalar.000000.raw"}],
         )
 
     manager.close()
@@ -676,27 +676,27 @@ def test_scalar_field_cli_raw_file_requires_shape_and_dtype(tmp_path: Path):
     manager.close()
 
 
-def test_scalar_field_cli_npy_and_visualization_sequence_manifest(tmp_path: Path):
-    archive_name = "scalar_field_cli_sequence.aca"
+def test_scalar_field_cli_npy_and_representation_manifest(tmp_path: Path):
+    archive_name = "scalar_field_cli_representation.aca"
     npy_path = tmp_path / "scalar.npy"
     field = np.arange(6, dtype=np.float64).reshape(2, 3)
     np.save(npy_path, field)
 
-    manifest_path = tmp_path / "sequence.json"
+    manifest_path = tmp_path / "representation.json"
     manifest_path.write_text(
         json.dumps(
             {
-                "name": "output/visualizations/temp_scalar_field",
-                "vis_type": "heatmap",
-                "source_dataset": "output",
-                "variables": [{"name": "temp", "role": "color-by"}],
+                "name": "output/representations/temp_scalar_field",
+                "format": "SCALAR_FIELD",
+                "sources": [{"dataset": "output", "variable": "temp"}],
+                "temporal_interpolation": "none",
                 "items": [
                     {
-                        "type": "SCALAR_FIELD",
-                        "name": "output/visualizations/temp_scalar_field/scalar.000000.raw",
+                        "dataset": "output/representations/temp_scalar_field/scalar.000000.raw",
+                        "source_step": 0,
+                        "source_time": 0.0,
                     }
                 ],
-                "metadata": {"colormap": "viridis"},
                 "replace": True,
             }
         ),
@@ -716,8 +716,8 @@ def test_scalar_field_cli_npy_and_visualization_sequence_manifest(tmp_path: Path
             "scalar-field",
             str(npy_path),
             "--name",
-            "output/visualizations/temp_scalar_field/scalar.000000.raw",
-            "visualization-sequence",
+            "output/representations/temp_scalar_field/scalar.000000.raw",
+            "representation",
             str(manifest_path),
         ],
         prog="hpc_campaign manager",
@@ -730,12 +730,11 @@ def test_scalar_field_cli_npy_and_visualization_sequence_manifest(tmp_path: Path
     assert scalar_dataset.metadata["shape"] == [2, 3]
     assert scalar_dataset.metadata["dtype"] == "float64"
 
-    sequence_info = next(iter(info_data.visualization_sequences.values()))
-    assert sequence_info.name == "output/visualizations/temp_scalar_field"
-    assert sequence_info.items[0].item_type == "SCALAR_FIELD"
-    assert sequence_info.items[0].dataset_name == scalar_dataset.name
-    assert [(entry.role, entry.name, entry.source_dataset_name) for entry in sequence_info.variables] == [
-        ("color-by", "temp", "output")
-    ]
+    representation = next(iter(info_data.representations.values()))
+    assert representation.name == "output/representations/temp_scalar_field"
+    assert representation.representation_format == "SCALAR_FIELD"
+    assert representation.field_name == "temp"
+    assert representation.items[0].dataset_name == scalar_dataset.name
+    assert representation.items[0].source_selections == {"temp": {"step": 0, "time": 0.0}}
 
     manager.close()
