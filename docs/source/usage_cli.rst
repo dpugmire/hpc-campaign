@@ -45,12 +45,10 @@ The [sub-command] argument can take one of the following values
 
 * **add-archival-storage** Register an archival location (tape system, https, s3)
 * **archived-replica** Create a replica of a dataset pointing to an archival storage location
-* **dataset** Add ADIOS2 or HDF5 files
-* **delete** Delete dataset/image/text, one or all replicas from a campaign archive
-* **scalar-field** Add one structured scalar-field representation item
-* **gaussian-splat** Add one Gaussian-splat representation item
-* **representation** Create or append a data representation from a JSON manifest
-* **image** Add images, embedded or remote optionally with an embedded thumbnail image
+* **data** Add ADIOS2 or HDF5 files
+* **delete** Delete datasets or replicas from a campaign archive
+* **variable** Create a logical variable or append chunks from a JSON manifest
+* **image-sequence** Ingest an ordered image representation from a JSON manifest
 * **info** List the content of a campaign archive
 * **text** Add text files, embedded or just reference to remote file
 * **time-series** Organizing a series of individual datasets as a single entry with extra dimension for time
@@ -112,7 +110,7 @@ Example usage:
   hpc_campaign manager demoproject/test_campaign_001 dataset run_001.bp run_002.h5
 
 
-Additional option (`\-\-name <NAME>`) can specify the representation name for one dataset in the campaign hierarchy. The same option can be applied to the text and image sub-commands.
+The optional `\-\-name <NAME>` argument assigns the campaign dataset name.
 
 **4. delete**
 
@@ -129,116 +127,59 @@ The optional options specifies what will be deleted:
 * `\-\-name <str> [<str> ...]` removes datasets by their representation name.
 * `\-\-replica <id> [<id> ...]` removes replicas by their ID number.
 
-**5. image**
+**5. variable**
 
-Add an image files to the archive. By default, only a remote reference is stored for image files but it can be stored (`\-\-store``) or a thumbnail with a smaller resolution can be stored. 
-
-Example usage:
-
-.. code-block:: bash
-
-  hpc_campaign manager demoproject/test_campaign_001 image remote_image.png
-  hpc_campaign manager demoproject/test_campaign_001 image stored_image.png --store
-  hpc_campaign manager demoproject/test_campaign_001 image big_image.jpg --thumbnail 64 64
-
-
-Additional options for images include:
-* `\-\-name, -n <NAME>` representation name for one image in the campaign hierarchy
-* `\-\-store, -s` stores the image file directly in the campaign archive instead of just a reference.
-* `\-\-thumbnail <X> <Y>` stores a resized image with an X-by-Y resolution as a thumbnail, while referring to the original.
-
-**6. scalar-field**
-
-Add a rank-2 scalar field to the archive. Raw scalar field files require an
-explicit shape and dtype. NumPy ``.npy`` files infer shape and dtype from the
-array unless these are supplied to validate or convert the input.
-
-Example usage:
-
-.. code-block:: bash
-
-  hpc_campaign manager demoproject/test_campaign_001 scalar-field pressure.000000.raw \
-    --name output/representations/pressure_scalar_field/scalar.000000.raw \
-    --shape 128 128 \
-    --dtype float32
-
-  hpc_campaign manager demoproject/test_campaign_001 scalar-field pressure.000000.npy \
-    --name output/representations/pressure_scalar_field/scalar.000000.raw
-
-
-Additional options for scalar fields include:
-
-* ``--layout`` scalar field memory layout. Currently only ``row-major`` is supported.
-* ``--encoding`` scalar field payload encoding. Currently only ``raw`` is supported.
-* ``--compression`` scalar field payload compression. Currently only ``none`` is supported.
-* ``--value-encoding`` scalar value representation. Currently only ``direct`` is supported.
-* ``--metadata-json <FILE>`` adds extra scalar field metadata from a JSON object.
-
-**7. gaussian-splat**
-
-Add one two-dimensional scalar Gaussian-splat timestep. The input is a NumPy
-``.npz`` file containing ``centers``, ``log_scales``, ``angles``,
-``amplitudes``, and ``bias`` arrays. Coordinate and value spaces must be
-explicit. Normalized spaces require typed transform objects in the metadata
-JSON.
-
-.. code-block:: bash
-
-  hpc_campaign manager demoproject/test_campaign_001 gaussian-splat \
-    pressure.000010.npz \
-    --name output/representations/pressure_gaussian/splat.000010.raw \
-    --metadata-json pressure_space.json
-
-**8. representation**
-
-Create or append a generic alternate data representation from a JSON manifest.
-The same relationship is used for scalar fields and Gaussian splats. Every item
-is one complete timestep and explicitly maps back to a step of each
-ground-truth source variable.
-
-Example manifest:
+Create a logical variable or append chunks using a JSON manifest:
 
 .. code-block:: json
 
   {
-    "name": "output/representations/pressure_scalar_field",
-    "format": "SCALAR_FIELD",
-    "sources": [{"dataset": "output", "variable": "pressure"}],
-    "temporal_interpolation": "none",
-    "items": [
-      {
-        "dataset": "output/representations/pressure_scalar_field/scalar.000000.raw",
-        "source_step": 0,
-        "source_time": 0.0
-      },
-      {
-        "dataset": "output/representations/pressure_scalar_field/scalar.000001.raw",
-        "source_step": 1,
-        "source_time": 0.1
-      }
-    ],
-    "replace": true
+    "dataset": "output.bp",
+    "variable": "pressure-mgard-1e-4",
+    "representation_kind": "mgard",
+    "representation_of": {
+      "dataset": "output.bp",
+      "variable": "pressure"
+    }
   }
 
-Example usage:
+.. code-block:: bash
+
+  hpc_campaign manager run.aca variable pressure-mgard.json
+
+For a chunked variable, add ``chunks`` and ``source_steps``. Use
+``--append`` to append chunks transactionally. Multi-parent
+``representation_of`` and ``source_steps`` objects are keyed by the same
+parent labels.
+
+**6. image-sequence**
+
+Ingest an ordered image sequence through the unified variable model:
+
+.. code-block:: json
+
+  {
+    "dataset": "visualizations",
+    "variable": "pressure-volume",
+    "images": ["rendered/frame*.png"],
+    "representation_of": {
+      "dataset": "output.bp",
+      "variable": "pressure"
+    },
+    "source_steps": [0, 5, 10],
+    "representation_metadata": {
+      "visualization": "volume_rendering"
+    },
+    "thumbnail": [256, 256],
+    "store": false
+  }
 
 .. code-block:: bash
 
-  hpc_campaign manager demoproject/test_campaign_001 representation pressure_representation.json
+  hpc_campaign manager run.aca image-sequence pressure-images.json
 
-See :doc:`data_representations` for the complete manifest, Gaussian payload,
-source-selection, transform, metric, and append contracts.
-
-**9. visualization-sequence**
-
-Add or replace a fixed rendered visualization sequence from a JSON manifest.
-Visualization sequence items are ``IMAGE`` datasets. Structured scalar fields
-and Gaussian splats use the ``representation`` command instead.
-
-.. code-block:: bash
-
-  hpc_campaign manager demoproject/test_campaign_001 visualization-sequence rendered_images.json
-
+Glob results are natural-sorted. Use ``--append`` for additional frames.
+See :doc:`data_representations` for validation and provenance semantics.
 
 **10. info**
 
@@ -338,7 +279,7 @@ Configuration:
   $ hpc_campaign manager demoproject/test_campaign_001 --truncate text runs/input-configuration.json
   $ hpc_campaign manager demoproject/test_campaign_001 dataset runs/simulation-output.bp runs/simulation-chekpoint.bp
   $ hpc_campaign manager demoproject/test_campaign_001 dataset analysis/pdf.bp
-  $ hpc_campaign manager demoproject/test_campaign_001 image analysis/plot-2d.png --store
+  $ hpc_campaign manager demoproject/test_campaign_001 image-sequence plot-images.json
 
   $ hpc_campaign manager demoproject/test_campaign_001 info
   =========================================================

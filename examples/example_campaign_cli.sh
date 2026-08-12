@@ -10,10 +10,9 @@ ACA=$PWD/example_cli.aca
 # add a data file with a representation name
 hpc_campaign manager $ACA --truncate data data/heat.bp  --name heat
 
-# add an image with a representation name
-hpc_campaign manager $ACA image data/T00000.png  --name T0
-hpc_campaign manager $ACA image data/T00001.png  --name T1 --store
-hpc_campaign manager $ACA image data/T00002.png  --name T2 --thumbnail 64 64
+# add an image sequence with one logical variable identity
+printf '%s\n' '{"dataset":"images","variable":"temperature","images":["data/T*.png"],"store":true,"thumbnail":[64,64]}' > /tmp/hpc-campaign-images.json
+hpc_campaign manager $ACA image-sequence /tmp/hpc-campaign-images.json
 
 # add a text file
 hpc_campaign manager $ACA text data/readme  --name readme --store
@@ -38,15 +37,8 @@ echo "faketape_dirID from info log:" ${faketape_dirID}
 # faking this, since there is no such location
 hpc_campaign manager $ACA archived-replica heat ${faketape_dirID} --newpath archivedheat.bp 
 
-# add a replica of T0 image located in the archival location (this has no embedded file)
-hpc_campaign manager $ACA archived-replica T0 ${faketape_dirID} 
-# add a replica of T1 image located in the archival location (this has embedded file)
-hpc_campaign manager $ACA archived-replica T1 ${faketape_dirID} 
-hpc_campaign manager $ACA delete --replica 3 
-
 # info
 hpc_campaign manager $ACA info -rfdc 
 
 # delete the aca
 # hpc_campaign rm --campaign_store $PWD example_cli.aca
-

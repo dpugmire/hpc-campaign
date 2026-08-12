@@ -8,51 +8,62 @@
 # pylint: disable=too-many-positional-arguments
 
 import argparse
+import glob
 import json
-import math
+import re
 import sqlite3
 import sys
+from hashlib import sha1
 from io import BytesIO
+from os import getcwd
 from os.path import exists
 from pathlib import Path
 from time import time_ns
+from typing import Any
 
-import numpy as np
 from PIL import Image as PILImage
 
-from .info import InfoResult, collect_info, print_image_associations, print_info
+from .info import InfoResult, collect_info, print_info
 from .key import read_key
 from .manager_args import ArgParser
 from .manager_funcs import (
     add_archival_storage,
-    add_gaussian_splat_data,
-    add_image_data,
-    add_scalar_field_data,
+    add_directory,
+    add_host_name,
+    add_key_id,
     add_time_series,
-    add_visualization_sequence,
     archive_dataset,
     check_archival_storage_system_name,
     create_tables,
     delete_dataset,
     delete_replica,
     delete_time_series,
+    get_host_name,
+    process_image,
+    process_image_data,
     set_default_args,
     update,
-)
-from .representations import (
-    add_representation_metric as add_representation_metric_to_archive,
-)
-from .representations import (
-    append_representation_item as append_representation_item_to_archive,
-)
-from .representations import (
-    create_representation as create_representation_in_archive,
 )
 from .upgrade import upgrade_aca
 from .utils import (
     check_campaign_store,
     sql_commit,
     sql_error_list,
+)
+from .variables import (
+    VariableDeleteImpact,
+    VariableRef,
+    variable_delete_impact,
+    variable_transaction,
+)
+from .variables import (
+    add_variable as add_logical_variable,
+)
+from .variables import (
+    delete_variable as delete_logical_variable,
+)
+from .variables import (
+    set_variable_relationships as set_logical_variable_relationships,
 )
 
 CURRENT_TIME = time_ns()
@@ -140,6 +151,7 @@ class Manager:  # pylint: disable=too-many-public-methods
 
         self.con = sqlite3.connect(self.args.campaign_file_name)
         self.con.row_factory = sqlite3.Row
+        self.con.execute("PRAGMA foreign_keys = ON")
         self.cur = self.con.cursor()
         self.connected = True
 
@@ -200,134 +212,6 @@ class Manager:  # pylint: disable=too-many-public-methods
         if not self.connected:
             self.open(create=True, truncate=False)
         update(cmd_args, self.cur, self.con)
-
-    def image(
-        self,
-        file_path: str | Path,
-        name: str | None = None,
-        store: bool = False,
-        thumbnail: list[int] | tuple[int, int] | None = None,
-        verbose: int | None = None,
-    ):
-        file_path = str(file_path)
-        thumb_value = None
-        if thumbnail is not None:
-            thumb_value = [int(thumbnail[0]), int(thumbnail[1])]
-        cmd_args = self._build_command_args(
-            "image",
-            {
-                "file": file_path,
-                "name": name,
-                "store": store,
-                "thumbnail": thumb_value,
-                "verbose": self.args.verbose if verbose is None else int(verbose),
-            },
-        )
-        if not self.connected:
-            self.open(create=True, truncate=False)
-        update(cmd_args, self.cur, self.con)
-
-    def image_data(
-        self,
-        data: bytes,
-        image_format: str,
-        name: str | None = None,
-        thumbnail: list[int] | tuple[int, int] | None = None,
-        replica_name: str | None = None,
-        store: bool = True,
-        verbose: int | None = None,
-    ):
-        if not store:
-            raise ValueError("image_data requires store=True because in-memory images have no external replica path")
-
-        thumb_value = None
-        if thumbnail is not None:
-            thumb_value = [int(thumbnail[0]), int(thumbnail[1])]
-        cmd_args = self._build_command_args(
-            "image_data",
-            {
-                "image_data": bytes(data),
-                "image_format": image_format,
-                "name": name,
-                "thumbnail": thumb_value,
-                "replica_name": replica_name,
-                "store": store,
-                "verbose": self.args.verbose if verbose is None else int(verbose),
-            },
-        )
-        if not self.connected:
-            self.open(create=True, truncate=False)
-        add_image_data(cmd_args, self.cur, self.con)
-
-    def scalar_field_data(
-        self,
-        data,
-        name: str | None = None,
-        dtype: str | None = None,
-        shape: list[int] | tuple[int, int] | None = None,
-        metadata=None,
-        layout: str = "row-major",
-        compression: str = "none",
-        encoding: str = "raw",
-        replica_name: str | None = None,
-        verbose: int | None = None,
-    ):
-        payload, scalar_metadata = self._coerce_scalar_field_input(
-            data=data,
-            dtype=dtype,
-            shape=shape,
-            metadata=metadata,
-            layout=layout,
-            compression=compression,
-            encoding=encoding,
-        )
-        cmd_args = self._build_command_args(
-            "scalar_field_data",
-            {
-                "scalar_field_data": payload,
-                "scalar_field_metadata": scalar_metadata,
-                "name": name,
-                "replica_name": replica_name,
-                "verbose": self.args.verbose if verbose is None else int(verbose),
-            },
-        )
-        if not self.connected:
-            self.open(create=True, truncate=False)
-        add_scalar_field_data(cmd_args, self.cur, self.con)
-
-    def gaussian_splat_data(
-        self,
-        data,
-        name: str | None = None,
-        metadata=None,
-        coordinate_space: str | None = None,
-        value_space: str | None = None,
-        coordinate_transform=None,
-        value_transform=None,
-        replica_name: str | None = None,
-        verbose: int | None = None,
-    ):
-        payload, splat_metadata = self._coerce_gaussian_splat_input(
-            data=data,
-            metadata=metadata,
-            coordinate_space=coordinate_space,
-            value_space=value_space,
-            coordinate_transform=coordinate_transform,
-            value_transform=value_transform,
-        )
-        cmd_args = self._build_command_args(
-            "gaussian_splat_data",
-            {
-                "gaussian_splat_data": payload,
-                "gaussian_splat_metadata": splat_metadata,
-                "name": name,
-                "replica_name": replica_name,
-                "verbose": self.args.verbose if verbose is None else int(verbose),
-            },
-        )
-        if not self.connected:
-            self.open(create=True, truncate=False)
-        add_gaussian_splat_data(cmd_args, self.cur, self.con)
 
     def delete_uuid(self, uuid: str):
         if not self.connected:
@@ -410,204 +294,169 @@ class Manager:  # pylint: disable=too-many-public-methods
             self.open(create=True, truncate=False)
         add_time_series(cmd_args, self.cur, self.con)
 
-    def create_representation(
+    def add_variable(
         self,
-        name: str,
-        representation_format: str,
-        sources,
-        field_name: str | None = None,
-        temporal_interpolation: str = "none",
-        parameter_correspondence: str | None = None,
-        metadata: dict | None = None,
-        replace: bool = False,
-    ) -> int:
-        if not self.connected:
-            self.open(create=True, truncate=False)
-        return create_representation_in_archive(
-            self.cur,
-            self.con,
-            name=name,
-            representation_format=representation_format,
-            sources=sources,
-            field_name=field_name,
-            temporal_interpolation=temporal_interpolation,
-            parameter_correspondence=parameter_correspondence,
-            metadata=metadata,
-            replace=replace,
-        )
-
-    def append_representation_item(
-        self,
-        representation: int | str,
+        *,
         dataset: str,
-        logical_time: float | None = None,
-        source_selections=None,
-        source_step: int | None = None,
-        source_time: float | None = None,
-        metrics=None,
-        metadata: dict | None = None,
-        item_order: int | None = None,
-    ) -> int:
+        variable: str,
+        chunks=None,
+        representation_of=None,
+        representation_kind: str | None = None,
+        representation_metadata=None,
+        source_steps=None,
+        preferred_preview: VariableRef | None = None,
+        append: bool = False,
+    ) -> VariableRef:
+        """Register a primary variable or an alternate representation."""
         if not self.connected:
             self.open(create=True, truncate=False)
-        return append_representation_item_to_archive(
+        return add_logical_variable(
             self.cur,
             self.con,
-            representation=representation,
             dataset=dataset,
-            logical_time=logical_time,
-            source_selections=source_selections,
-            source_step=source_step,
-            source_time=source_time,
-            metrics=metrics,
-            metadata=metadata,
-            item_order=item_order,
+            variable=variable,
+            chunks=chunks,
+            representation_of=representation_of,
+            representation_kind=representation_kind,
+            representation_metadata=representation_metadata,
+            source_steps=source_steps,
+            preferred_preview=preferred_preview,
+            append=append,
         )
 
-    def add_representation_metric(
-        self,
-        representation: int | str,
-        name: str,
-        value: float,
-        units: str | None = None,
-        norm: str | None = None,
-        relative: bool = False,
-        metadata: dict | None = None,
-    ) -> int:
+    def set_variable_relationships(self, variable: VariableRef, representation_of, source_steps=None) -> None:
+        """Explicitly replace a variable's immediate representation parents."""
         if not self.connected:
             self.open(create=True, truncate=False)
-        return add_representation_metric_to_archive(
+        set_logical_variable_relationships(
             self.cur,
             self.con,
-            representation=representation,
-            name=name,
-            value=value,
-            units=units,
-            norm=norm,
-            relative=relative,
-            metadata=metadata,
+            variable,
+            representation_of,
+            source_steps=source_steps,
         )
 
-    def visualization_sequence(
-        self,
-        name: str,
-        vis_type: str,
-        variables,
-        items,
-        source_dataset: str | None = None,
-        thumbnail_name: str | None = None,
-        thumbnail_uuid: str | None = None,
-        metadata=None,
-        replace: bool = False,
-    ) -> int:
-        cmd_args = self._build_command_args(
-            "visualization_sequence",
-            {
-                "name": name,
-                "vis_type": vis_type,
-                "variables": variables,
-                "items": items,
-                "source_dataset": source_dataset,
-                "thumbnail_name": thumbnail_name,
-                "thumbnail_uuid": thumbnail_uuid,
-                "metadata": metadata,
-                "replace": replace,
-            },
-        )
+    def variable_delete_impact(self, variable: VariableRef) -> VariableDeleteImpact:
+        """Report variables affected by deleting a logical variable."""
         if not self.connected:
             self.open(create=True, truncate=False)
-        return add_visualization_sequence(cmd_args, self.cur, self.con)
+        return variable_delete_impact(self.cur, variable)
 
-    def visualization(
+    def delete_variable(self, variable: VariableRef, *, cascade: bool = False) -> VariableDeleteImpact:
+        """Delete a logical variable and optionally its downstream representations."""
+        if not self.connected:
+            self.open(create=True, truncate=False)
+        return delete_logical_variable(self.cur, self.con, variable, cascade=cascade)
+
+    def add_image_sequence(
         self,
+        *,
+        dataset: str,
+        variable: str,
         images,
-        vis_type: str | None = None,
-        variables=None,
-        source_dataset: str | None = None,
-        name: str | None = None,
-        sequence_name: str | None = None,
-        image_names: str | list[str] | None = None,
-        steps: list[int] | tuple[int, ...] | None = None,
-        image_format: str | None = None,
-        thumbnail: list[int] | tuple[int, int] | None = None,
-        thumbnail_image: int = 0,
+        representation_of=None,
+        source_steps=None,
+        representation_metadata=None,
         store: bool = False,
-        metadata=None,
-        replace: bool = False,
-        kind: str | None = None,
-        variable: str | None = None,
-        color_by: str | None = None,
-        contour_by: str | None = None,
-        streamline_by=None,
-        x_axis: str | None = None,
-        y_axis=None,
-        verbose: int | None = None,
-    ) -> int:
-        image_inputs = self._normalize_visualization_images(images)
+        thumbnail: list[int] | tuple[int, int] | None = None,
+        preferred_preview: VariableRef | None = None,
+        append: bool = False,
+    ) -> VariableRef:
+        """Ingest an ordered, homogeneous image sequence as a logical variable."""
+        if not self.connected:
+            self.open(create=True, truncate=False)
+
+        image_inputs = self._expand_image_sequence_inputs(images)
         if not image_inputs:
-            raise ValueError("visualization requires at least one image")
+            action = "append" if append else "create"
+            raise ValueError(f"add_image_sequence requires one or more images to {action} a sequence")
+        descriptors = [self._describe_image_sequence_input(image) for image in image_inputs]
+        self._validate_image_sequence_descriptors(descriptors)
+        if append:
+            existing_signature = self._existing_image_sequence_signature(dataset, variable)
+            self._validate_image_sequence_append(descriptors[0], existing_signature)
+        if not store and any(descriptor["data"] is not None for descriptor in descriptors):
+            raise ValueError("In-memory images require store=True because they have no external replica path")
 
-        resolved_vis_type = self._resolve_visualization_kind(kind, vis_type)
-        variable_specs = self._build_visualization_variable_specs(
-            variables=variables,
-            variable=variable,
-            color_by=color_by,
-            contour_by=contour_by,
-            streamline_by=streamline_by,
-            x_axis=x_axis,
-            y_axis=y_axis,
-            source_dataset=source_dataset,
-        )
-        sequence_name = self._resolve_visualization_sequence_name(
-            source_dataset=source_dataset,
-            name=name,
-            sequence_name=sequence_name,
-            variables=variable_specs,
-        )
-        logical_image_names = self._resolve_visualization_image_names(
-            image_inputs=image_inputs,
-            sequence_name=sequence_name,
-            image_names=image_names,
-            steps=steps,
-            image_format=image_format,
-        )
+        thumb_value = None
+        if thumbnail is not None:
+            if len(thumbnail) != 2:
+                raise ValueError("thumbnail must contain [width, height]")
+            thumb_value = [int(thumbnail[0]), int(thumbnail[1])]
+            if any(value <= 0 for value in thumb_value):
+                raise ValueError("thumbnail dimensions must be positive")
 
-        if not 0 <= int(thumbnail_image) < len(image_inputs):
-            raise ValueError("thumbnail_image index is out of range")
+        payload_names: list[str] = []
+        with variable_transaction(self.con, "image_sequence_write"):
+            long_host_name, short_host_name = get_host_name(self.args)
+            verbose = bool(self.args.verbose)
+            host_id = add_host_name(long_host_name, short_host_name, self.cur, verbose=verbose)
+            key_id = add_key_id(self.args.encryption_key_id, self.cur, verbose=verbose)
+            rootdir = getcwd()
+            dir_id = add_directory(host_id, rootdir, self.cur, verbose=verbose)
 
-        image_verbose = int(self.args.verbose if verbose is None else verbose)
-        for idx, image_input in enumerate(image_inputs):
-            logical_name = logical_image_names[idx]
-            if self._is_path_like_image(image_input):
-                self.image(
-                    str(image_input),
-                    name=logical_name,
-                    store=store,
-                    thumbnail=thumbnail,
-                    verbose=image_verbose,
-                )
-            else:
-                image_bytes, resolved_format = self._coerce_image_input(image_input, image_format)
-                self.image_data(
-                    image_bytes,
-                    resolved_format,
-                    name=logical_name,
-                    thumbnail=thumbnail,
-                    replica_name=f"generated/{Path(logical_name).name}",
-                    store=store,
-                    verbose=image_verbose,
-                )
+            variable_token = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(variable)).strip("_") or "variable"
+            for descriptor in descriptors:
+                suffix = "." + str(descriptor["format"]).lower().replace("jpeg", "jpg")
+                payload_name = f"{dataset}/.variable-payloads/{variable_token}/{descriptor['identity']}{suffix}"
+                payload_names.append(payload_name)
+                if descriptor["path"] is not None:
+                    cmd_args = self._build_command_args(
+                        "image",
+                        {
+                            "file": str(descriptor["path"]),
+                            "name": payload_name,
+                            "store": bool(store),
+                            "thumbnail": thumb_value,
+                            "verbose": self.args.verbose,
+                        },
+                    )
+                    process_image(
+                        cmd_args,
+                        self.cur,
+                        host_id,
+                        dir_id,
+                        key_id,
+                        long_host_name + rootdir,
+                        rootdir,
+                    )
+                else:
+                    image_format = str(descriptor["format"])
+                    cmd_args = self._build_command_args(
+                        "image_data",
+                        {
+                            "image_data": descriptor["data"],
+                            "image_format": image_format,
+                            "name": payload_name,
+                            "thumbnail": thumb_value,
+                            "replica_name": f"generated/{descriptor['identity']}{suffix}",
+                            "store": True,
+                            "verbose": self.args.verbose,
+                        },
+                    )
+                    process_image_data(
+                        cmd_args,
+                        self.cur,
+                        host_id,
+                        dir_id,
+                        key_id,
+                        long_host_name + rootdir,
+                        rootdir,
+                    )
 
-        return self.visualization_sequence(
-            name=sequence_name,
-            vis_type=resolved_vis_type,
-            variables=variable_specs,
-            items=[{"type": "IMAGE", "name": logical_name} for logical_name in logical_image_names],
-            source_dataset=source_dataset,
-            thumbnail_name=logical_image_names[int(thumbnail_image)],
-            metadata=metadata,
-            replace=replace,
-        )
+            return add_logical_variable(
+                self.cur,
+                self.con,
+                dataset=dataset,
+                variable=variable,
+                chunks=payload_names,
+                representation_of=representation_of,
+                representation_kind="image",
+                representation_metadata=representation_metadata,
+                source_steps=source_steps,
+                preferred_preview=preferred_preview,
+                append=append,
+            )
 
     def upgrade(self) -> str:
         if not self.connected:
@@ -620,15 +469,130 @@ class Manager:  # pylint: disable=too-many-public-methods
             return [str(files)]
         return [str(entry) for entry in files]
 
-    def _normalize_visualization_images(self, images):
-        if isinstance(images, (str, Path, bytes, bytearray, memoryview, PILImage.Image)):
-            return [images]
-        if self._is_matplotlib_figure(images):
-            return [images]
-        return list(images)
+    @staticmethod
+    def _natural_path_key(path: str | Path) -> list[tuple[int, str | int]]:
+        parts = re.split(r"(\d+)", str(path).casefold())
+        return [(1, int(part)) if part.isdigit() else (0, part) for part in parts]
 
-    def _is_path_like_image(self, image) -> bool:
-        return isinstance(image, (str, Path))
+    def _expand_image_sequence_inputs(self, images) -> list:
+        if isinstance(images, (str, Path, bytes, bytearray, memoryview, PILImage.Image)):
+            raw_inputs: list[Any] = [images]
+        elif self._is_matplotlib_figure(images):
+            raw_inputs = [images]
+        else:
+            raw_inputs = list(images)
+
+        expanded: list[Any] = []
+        for image in raw_inputs:
+            if not isinstance(image, (str, Path)):
+                expanded.append(image)
+                continue
+            path_text = str(image)
+            if glob.has_magic(path_text):
+                matches = sorted(glob.glob(path_text), key=self._natural_path_key)
+                if not matches:
+                    raise ValueError(f"Image pattern matched no files: {path_text}")
+                expanded.extend(Path(match) for match in matches)
+            else:
+                expanded.append(Path(image))
+        return expanded
+
+    def _describe_image_sequence_input(self, image) -> dict:
+        if isinstance(image, (str, Path)):
+            path = Path(image)
+            if not path.is_file():
+                raise FileNotFoundError(f"Image file not found: {path}")
+            with PILImage.open(path) as opened:
+                opened.load()
+                image_format = str(opened.format or "").upper()
+                if not image_format:
+                    raise ValueError(f"Could not determine image encoding: {path}")
+                size = tuple(int(value) for value in opened.size)
+                mode = str(opened.mode)
+            identity = sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:24]
+            return {
+                "path": path,
+                "data": None,
+                "format": image_format,
+                "size": size,
+                "mode": mode,
+                "identity": identity,
+            }
+
+        image_data, image_format = self._coerce_image_input(image, None)
+        try:
+            with PILImage.open(BytesIO(image_data)) as opened:
+                opened.load()
+                detected_format = str(opened.format or image_format).upper()
+                size = tuple(int(value) for value in opened.size)
+                mode = str(opened.mode)
+        except Exception as exc:
+            raise ValueError("Invalid in-memory image payload") from exc
+        identity = sha1(image_data).hexdigest()[:24]
+        return {
+            "path": None,
+            "data": image_data,
+            "format": detected_format,
+            "size": size,
+            "mode": mode,
+            "identity": identity,
+        }
+
+    @staticmethod
+    def _validate_image_sequence_descriptors(descriptors: list[dict]) -> None:
+        first = descriptors[0]
+        first_width, first_height = first["size"]
+        for descriptor in descriptors[1:]:
+            if descriptor["size"] != first["size"]:
+                raise ValueError("All images in a sequence must have the same resolution and aspect ratio")
+            if descriptor["format"] != first["format"]:
+                raise ValueError("All images in a sequence must use the same encoding")
+            if descriptor["mode"] != first["mode"]:
+                raise ValueError("All images in a sequence must use the same pixel mode")
+            width, height = descriptor["size"]
+            if width * first_height != first_width * height:
+                raise ValueError("All images in a sequence must have the same aspect ratio")
+
+    def _existing_image_sequence_signature(self, dataset: str, variable: str) -> tuple | None:
+        row = self.cur.execute(
+            "select resolution.x, resolution.y, replica.name as replica_name, file.name as file_name "
+            "from logical_variable as logical "
+            "join dataset as owner on owner.rowid = logical.datasetid "
+            "join variable_chunk as chunk on chunk.variableid = logical.variableid "
+            "join replica on replica.datasetid = chunk.payload_datasetid and replica.deltime = 0 "
+            "left join resolution on resolution.replicaid = replica.rowid "
+            "left join repfiles on repfiles.replicaid = replica.rowid "
+            "left join file on file.fileid = repfiles.fileid "
+            "where owner.name = ? and logical.name = ? "
+            "order by chunk.chunk_index, replica.rowid, file.fileid limit 1",
+            (dataset, variable),
+        ).fetchone()
+        if row is None or row["x"] is None or row["y"] is None:
+            return None
+        suffix = Path(str(row["replica_name"] or "")).suffix.lower()
+        if not suffix:
+            suffix = Path(str(row["file_name"] or "")).suffix.lower()
+        encoding = {
+            ".jpg": "JPEG",
+            ".jpeg": "JPEG",
+            ".png": "PNG",
+            ".gif": "GIF",
+            ".webp": "WEBP",
+            ".bmp": "BMP",
+            ".tif": "TIFF",
+            ".tiff": "TIFF",
+        }.get(suffix)
+        return (int(row["x"]), int(row["y"]), encoding)
+
+    @staticmethod
+    def _validate_image_sequence_append(descriptor: dict, existing_signature: tuple | None) -> None:
+        if existing_signature is None:
+            return
+        width, height, encoding = existing_signature
+        if descriptor["size"] != (width, height):
+            raise ValueError("Appended images must have the same resolution and aspect ratio as the sequence")
+        if encoding is not None and descriptor["format"] != encoding:
+            raise ValueError("Appended images must use the same encoding as the sequence")
 
     def _is_matplotlib_figure(self, image) -> bool:
         image_type = type(image)
@@ -664,442 +628,7 @@ class Manager:  # pylint: disable=too-many-public-methods
             buf = BytesIO()
             image.savefig(buf, format=resolved_format.lower())
             return buf.getvalue(), resolved_format
-        raise TypeError(f"Unsupported visualization image input type: {type(image)!r}")
-
-    def _validate_scalar_field_storage_options(self, layout: str, compression: str, encoding: str):
-        layout_value = str(layout or "").strip().lower()
-        if layout_value != "row-major":
-            raise ValueError("Only row-major scalar field layout is supported currently")
-
-        compression_value = str(compression or "").strip().lower()
-        if compression_value != "none":
-            raise ValueError("Only compression='none' is supported for scalar fields currently")
-
-        encoding_value = str(encoding or "").strip().lower()
-        if encoding_value != "raw":
-            raise ValueError("Only encoding='raw' is supported for scalar fields currently")
-
-    def _normalize_scalar_field_shape(self, shape: list[int] | tuple[int, int] | None) -> tuple[int, ...]:
-        shape_tuple = tuple(int(dim) for dim in shape) if shape is not None else ()
-        if shape_tuple and len(shape_tuple) != 2:
-            raise ValueError("shape=[height, width] must contain exactly two dimensions")
-        return shape_tuple
-
-    def _normalize_scalar_field_input_data(self, data):
-        if isinstance(data, memoryview):
-            return data.tobytes()
-        if isinstance(data, bytearray):
-            return bytes(data)
-        return data
-
-    def _scalar_field_storage_dtype(self, dtype) -> np.dtype:
-        storage_dtype = np.dtype(dtype).newbyteorder("<")
-        if storage_dtype.kind not in {"f", "u", "i"}:
-            raise ValueError(f"Unsupported scalar field dtype: {storage_dtype.name}")
-        return storage_dtype
-
-    def _coerce_scalar_field_bytes(
-        self,
-        data: bytes,
-        dtype: str | None,
-        shape_tuple: tuple[int, ...],
-    ) -> tuple[bytes, np.ndarray, np.dtype]:
-        if dtype is None:
-            raise ValueError("dtype is required when scalar field data is bytes")
-        if len(shape_tuple) != 2:
-            raise ValueError("shape=[height, width] is required when scalar field data is bytes")
-
-        storage_dtype = self._scalar_field_storage_dtype(dtype)
-        expected = math.prod(shape_tuple) * storage_dtype.itemsize
-        if len(data) != expected:
-            raise ValueError(f"Scalar field byte payload has {len(data)} bytes; expected {expected}")
-
-        arr = np.frombuffer(data, dtype=storage_dtype).reshape(shape_tuple)
-        return data, arr, storage_dtype
-
-    def _coerce_scalar_field_array(
-        self,
-        data,
-        dtype: str | None,
-        shape_tuple: tuple[int, ...],
-    ) -> tuple[bytes, np.ndarray, np.dtype, tuple[int, ...]]:
-        arr = np.asarray(data)
-        if arr.ndim != 2:
-            raise ValueError("scalar_field_data requires a rank-2 array or explicit shape=[height, width]")
-        if len(shape_tuple) == 2 and shape_tuple != tuple(int(dim) for dim in arr.shape):
-            raise ValueError(f"shape={list(shape_tuple)} does not match scalar field array shape={list(arr.shape)}")
-
-        array_shape = tuple(int(dim) for dim in arr.shape)
-        storage_dtype = self._scalar_field_storage_dtype(dtype if dtype is not None else arr.dtype)
-        arr = np.ascontiguousarray(arr.astype(storage_dtype, copy=False))
-        return arr.tobytes(order="C"), arr, storage_dtype, array_shape
-
-    def _build_scalar_field_metadata(
-        self,
-        metadata,
-        shape_tuple: tuple[int, ...],
-        storage_dtype: np.dtype,
-        arr: np.ndarray,
-    ) -> dict:
-        if shape_tuple[0] <= 0 or shape_tuple[1] <= 0:
-            raise ValueError("Scalar field shape must be [height, width] with positive dimensions")
-
-        scalar_metadata = dict(metadata or {})
-        value_encoding = str(scalar_metadata.get("value_encoding", "direct") or "direct").strip().lower()
-        if value_encoding != "direct":
-            raise ValueError("Only value_encoding='direct' is supported for scalar fields currently")
-        scalar_metadata.update(
-            {
-                "format_version": 1,
-                "kind": "scalarField",
-                "rank": 2,
-                "shape": [int(shape_tuple[0]), int(shape_tuple[1])],
-                "dtype": storage_dtype.name,
-                "byte_order": "little",
-                "layout": "row-major",
-                "encoding": "raw",
-                "compression": "none",
-                "value_encoding": "direct",
-            }
-        )
-
-        if "min" not in scalar_metadata or "max" not in scalar_metadata:
-            if storage_dtype.kind == "f":
-                finite = arr[np.isfinite(arr)]
-            else:
-                finite = arr.reshape(-1)
-            if finite.size:
-                scalar_metadata.setdefault("min", float(np.min(finite)))
-                scalar_metadata.setdefault("max", float(np.max(finite)))
-
-        return scalar_metadata
-
-    def _coerce_scalar_field_input(
-        self,
-        data,
-        dtype: str | None,
-        shape: list[int] | tuple[int, int] | None,
-        metadata,
-        layout: str,
-        compression: str,
-        encoding: str,
-    ) -> tuple[bytes, dict]:
-        self._validate_scalar_field_storage_options(layout, compression, encoding)
-        shape_tuple = self._normalize_scalar_field_shape(shape)
-        data = self._normalize_scalar_field_input_data(data)
-
-        if isinstance(data, bytes):
-            payload, arr, storage_dtype = self._coerce_scalar_field_bytes(data, dtype, shape_tuple)
-        else:
-            payload, arr, storage_dtype, shape_tuple = self._coerce_scalar_field_array(data, dtype, shape_tuple)
-
-        if len(shape_tuple) != 2:
-            raise ValueError("Scalar field shape must be [height, width] with positive dimensions")
-
-        scalar_metadata = self._build_scalar_field_metadata(metadata, shape_tuple, storage_dtype, arr)
-        return payload, scalar_metadata
-
-    def _coerce_gaussian_splat_input(  # pylint: disable=too-many-statements
-        self,
-        data,
-        metadata,
-        coordinate_space: str | None,
-        value_space: str | None,
-        coordinate_transform,
-        value_transform,
-    ) -> tuple[bytes, dict]:
-        if not isinstance(data, dict):
-            raise TypeError("gaussian_splat_data requires a dictionary of parameter arrays")
-        required_components = ("centers", "log_scales", "angles", "amplitudes", "bias")
-        missing = [component for component in required_components if component not in data]
-        if missing:
-            raise ValueError(f"Gaussian-splat data is missing components: {', '.join(missing)}")
-
-        centers = np.asarray(data["centers"])
-        if centers.ndim != 2 or centers.shape[1] != 2 or centers.shape[0] <= 0:
-            raise ValueError("Gaussian-splat centers must have shape [N, 2] with N > 0")
-        count = int(centers.shape[0])
-        component_shapes = {
-            "centers": (count, 2),
-            "log_scales": (count, 2),
-            "angles": (count,),
-            "amplitudes": (count,),
-            "bias": (1,),
-        }
-
-        arrays: dict[str, np.ndarray] = {}
-        for component in required_components:
-            value = np.asarray(data[component])
-            if component == "bias":
-                if value.size != 1:
-                    raise ValueError("Gaussian-splat bias must be a scalar")
-                value = value.reshape(1)
-            if tuple(value.shape) != component_shapes[component]:
-                raise ValueError(
-                    f"Gaussian-splat {component} must have shape {list(component_shapes[component])}; "
-                    f"received {list(value.shape)}"
-                )
-            array = np.ascontiguousarray(value, dtype="<f4")
-            if not np.all(np.isfinite(array)):
-                raise ValueError(f"Gaussian-splat {component} must contain only finite values")
-            arrays[component] = array
-
-        splat_metadata = dict(metadata or {})
-        resolved_coordinate_space = str(
-            coordinate_space or splat_metadata.get("coordinate_space", "") or ""
-        ).strip().lower()
-        resolved_value_space = str(value_space or splat_metadata.get("value_space", "") or "").strip().lower()
-        if resolved_coordinate_space not in {"normalized", "physical"}:
-            raise ValueError("coordinate_space must be either 'normalized' or 'physical'")
-        if resolved_value_space not in {"normalized", "physical"}:
-            raise ValueError("value_space must be either 'normalized' or 'physical'")
-
-        resolved_coordinate_transform = (
-            coordinate_transform
-            if coordinate_transform is not None
-            else splat_metadata.get("coordinate_transform")
-        )
-        resolved_value_transform = (
-            value_transform if value_transform is not None else splat_metadata.get("value_transform")
-        )
-        if resolved_coordinate_space == "normalized" and not isinstance(resolved_coordinate_transform, dict):
-            raise ValueError("normalized Gaussian coordinates require coordinate_transform metadata")
-        if resolved_value_space == "normalized" and not isinstance(resolved_value_transform, dict):
-            raise ValueError("normalized Gaussian values require value_transform metadata")
-        if resolved_coordinate_transform is not None and not isinstance(resolved_coordinate_transform, dict):
-            raise TypeError("coordinate_transform must be a dictionary")
-        if resolved_value_transform is not None and not isinstance(resolved_value_transform, dict):
-            raise TypeError("value_transform must be a dictionary")
-        if resolved_coordinate_transform and not str(resolved_coordinate_transform.get("type", "") or "").strip():
-            raise ValueError("coordinate_transform requires a non-empty type")
-        if resolved_value_transform and not str(resolved_value_transform.get("type", "") or "").strip():
-            raise ValueError("value_transform requires a non-empty type")
-
-        component_records = []
-        payload_parts = []
-        offset = 0
-        for component in required_components:
-            array = arrays[component]
-            component_payload = array.tobytes(order="C")
-            component_records.append(
-                {
-                    "name": component,
-                    "shape": list(array.shape),
-                    "offset": offset,
-                    "length": len(component_payload),
-                }
-            )
-            payload_parts.append(component_payload)
-            offset += len(component_payload)
-
-        splat_metadata.update(
-            {
-                "format_version": 1,
-                "kind": "gaussianSplat",
-                "model": "anisotropic-2d-scalar",
-                "spatial_dimensions": 2,
-                "count": count,
-                "dtype": "float32",
-                "byte_order": "little",
-                "layout": "structure-of-arrays",
-                "encoding": "raw",
-                "compression": "none",
-                "scale_encoding": "log",
-                "angle_units": "radians",
-                "coordinate_order": ["x", "y"],
-                "kernel": "unnormalized-anisotropic-gaussian",
-                "rotation_convention": "u=dx*cos(angle)+dy*sin(angle);v=-dx*sin(angle)+dy*cos(angle)",
-                "reconstruction": "bias+sum(amplitude*exp(-0.5*((u/exp(log_scale_x))^2+(v/exp(log_scale_y))^2)))",
-                "coordinate_space": resolved_coordinate_space,
-                "coordinate_transform": resolved_coordinate_transform or {},
-                "value_space": resolved_value_space,
-                "value_transform": resolved_value_transform or {},
-                "components": component_records,
-                "payload_bytes": offset,
-            }
-        )
-        return b"".join(payload_parts), splat_metadata
-
-    def _normalize_visualization_variable_specs(self, variables, source_dataset: str | None):
-        if isinstance(variables, (str, dict, tuple)):
-            variable_list = [variables]
-        else:
-            variable_list = list(variables)
-        normalized = []
-        default_source_dataset = source_dataset or ""
-        for entry in variable_list:
-            if isinstance(entry, str):
-                normalized.append({"name": entry, "role": "primary", "source_dataset": default_source_dataset})
-                continue
-            if isinstance(entry, dict):
-                item = dict(entry)
-                if "source_dataset" not in item or not item.get("source_dataset"):
-                    item["source_dataset"] = default_source_dataset
-                if ("role" not in item or not item.get("role")) and item.get("use"):
-                    item["role"] = item["use"]
-                if "role" not in item or not item.get("role"):
-                    item["role"] = "primary"
-                normalized.append(item)
-                continue
-            if isinstance(entry, tuple):
-                if len(entry) == 0:
-                    continue
-                item = {"name": entry[0], "role": "primary", "source_dataset": default_source_dataset}
-                if len(entry) >= 2 and entry[1]:
-                    item["role"] = entry[1]
-                if len(entry) >= 3 and entry[2]:
-                    item["source_dataset"] = entry[2]
-                normalized.append(item)
-                continue
-            raise TypeError(f"Unsupported variable specification: {entry!r}")
-        if not normalized:
-            raise ValueError("visualization requires at least one variable specification")
-        for item in normalized:
-            if not item.get("source_dataset"):
-                raise ValueError(f"Variable {item.get('name')!r} requires source_dataset")
-        return normalized
-
-    def _resolve_visualization_kind(self, kind: str | None, vis_type: str | None) -> str:
-        if kind and vis_type and kind != vis_type:
-            raise ValueError("visualization received both kind and vis_type with different values")
-        return str(kind or vis_type or "visualization")
-
-    def _semantic_variable_specs(
-        self,
-        variable: str | None,
-        color_by: str | None,
-        contour_by: str | None,
-        streamline_by,
-        x_axis: str | None,
-        y_axis,
-    ) -> list[dict[str, str]]:
-        specs: list[dict[str, str]] = []
-        if variable:
-            specs.append({"name": str(variable), "role": "primary"})
-        if color_by:
-            specs.append({"name": str(color_by), "role": "color-by"})
-        if contour_by:
-            specs.append({"name": str(contour_by), "role": "contour-by"})
-        if streamline_by:
-            if isinstance(streamline_by, (str, Path)):
-                specs.append({"name": str(streamline_by), "role": "streamline-by"})
-            else:
-                names = [str(entry) for entry in streamline_by]
-                if len(names) == 2:
-                    specs.append({"name": names[0], "role": "streamline-x"})
-                    specs.append({"name": names[1], "role": "streamline-y"})
-                else:
-                    for name in names:
-                        specs.append({"name": name, "role": "streamline-by"})
-        if x_axis:
-            specs.append({"name": str(x_axis), "role": "x-axis"})
-        if y_axis:
-            if isinstance(y_axis, (str, Path)):
-                y_names = [str(y_axis)]
-            else:
-                y_names = [str(entry) for entry in y_axis]
-            for name in y_names:
-                specs.append({"name": name, "role": "y-axis"})
-        return specs
-
-    def _build_visualization_variable_specs(
-        self,
-        variables,
-        variable: str | None,
-        color_by: str | None,
-        contour_by: str | None,
-        streamline_by,
-        x_axis: str | None,
-        y_axis,
-        source_dataset: str | None,
-    ):
-        semantic_specs = self._semantic_variable_specs(variable, color_by, contour_by, streamline_by, x_axis, y_axis)
-        if variables is not None and semantic_specs:
-            raise ValueError("Use either variables=... or semantic arguments, not both")
-        variable_inputs = variables if variables is not None else semantic_specs
-        return self._normalize_visualization_variable_specs(variable_inputs, source_dataset)
-
-    def _default_visualization_token(self, variables) -> str:
-        if len(variables) == 1 and variables[0]["role"] == "primary":
-            return str(variables[0]["name"])
-        parts = [f"{entry['role']}-{entry['name']}" for entry in variables]
-        return "__".join(parts)
-
-    def _default_visualization_name(self, source_dataset: str | None, variables) -> str:
-        root = source_dataset
-        if not root:
-            root = variables[0]["source_dataset"]
-        if not root:
-            root = "visualization"
-        return f"{root}/visualizations/{self._default_visualization_token(variables)}"
-
-    def _resolve_visualization_sequence_name(
-        self,
-        source_dataset: str | None,
-        name: str | None,
-        sequence_name: str | None,
-        variables,
-    ) -> str:
-        if name and sequence_name:
-            raise ValueError("Use either name or sequence_name, not both")
-        if sequence_name:
-            return str(sequence_name)
-        if not name:
-            return self._default_visualization_name(source_dataset, variables)
-        if "/" in str(name):
-            return str(name)
-        root = source_dataset or variables[0]["source_dataset"] or "visualization"
-        return f"{root}/visualizations/{name}"
-
-    def _resolve_visualization_image_names(
-        self,
-        image_inputs,
-        sequence_name: str,
-        image_names,
-        steps,
-        image_format: str | None,
-    ) -> list[str]:
-        if image_names is not None:
-            if isinstance(image_names, (str, Path)):
-                names = [str(image_names)]
-            else:
-                names = [str(entry) for entry in image_names]
-            if len(names) != len(image_inputs):
-                raise ValueError("image_names length must match number of images")
-            return names
-
-        if steps is not None:
-            step_values = [int(step) for step in steps]
-            if len(step_values) != len(image_inputs):
-                raise ValueError("steps length must match number of images")
-        else:
-            step_values = list(range(len(image_inputs)))
-
-        generated: list[str] = []
-        for step, image_input in zip(step_values, image_inputs, strict=True):
-            suffix = self._guess_image_suffix(image_input, image_format)
-            generated.append(f"{sequence_name}/image.{step:06d}{suffix}")
-        return generated
-
-    def _guess_image_suffix(self, image_input, image_format: str | None) -> str:
-        if isinstance(image_input, Path):
-            suffix = image_input.suffix
-            if suffix:
-                return suffix
-        if isinstance(image_input, str):
-            suffix = Path(image_input).suffix
-            if suffix:
-                return suffix
-        if image_format:
-            return "." + image_format.lower().lstrip(".")
-        if isinstance(image_input, (bytes, bytearray, memoryview)):
-            data = bytes(image_input)
-            inferred = self._infer_image_format(data)
-            if inferred == "JPEG":
-                return ".jpg"
-            if inferred:
-                return "." + inferred.lower()
-        return ".png"
+        raise TypeError(f"Unsupported image-sequence input type: {type(image)!r}")
 
 
 def _load_json_object(path: str, label: str) -> dict:
@@ -1108,31 +637,6 @@ def _load_json_object(path: str, label: str) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"{label} must contain a JSON object")
     return data
-
-
-def _load_scalar_field_cli_input(args: argparse.Namespace) -> tuple[bytes | np.ndarray, dict]:
-    input_path = Path(args.file)
-    metadata = _load_json_object(args.metadata_json, "scalar field metadata") if args.metadata_json else {}
-    if args.value_encoding is not None:
-        metadata["value_encoding"] = args.value_encoding
-
-    if input_path.suffix.lower() == ".npy":
-        return np.load(input_path, allow_pickle=False), metadata
-    return input_path.read_bytes(), metadata
-
-
-def _load_gaussian_splat_cli_input(args: argparse.Namespace) -> tuple[dict[str, np.ndarray], dict]:
-    input_path = Path(args.file)
-    if input_path.suffix.lower() != ".npz":
-        raise ValueError("gaussian-splat CLI input must be a NumPy .npz file")
-    metadata = _load_json_object(args.metadata_json, "Gaussian-splat metadata") if args.metadata_json else {}
-    with np.load(input_path, allow_pickle=False) as archive:
-        required = ("centers", "log_scales", "angles", "amplitudes", "bias")
-        missing = [name for name in required if name not in archive]
-        if missing:
-            raise ValueError(f"Gaussian-splat .npz input is missing arrays: {', '.join(missing)}")
-        data = {name: np.asarray(archive[name]) for name in required}
-    return data, metadata
 
 
 def _require_manifest_fields(
@@ -1145,60 +649,57 @@ def _require_manifest_fields(
         raise ValueError(f"{label} is missing required field(s): {', '.join(missing)}")
 
 
-def _apply_representation_manifest(manager: Manager, manifest: dict, replace: bool = False) -> int:
-    _require_manifest_fields(manifest, ("name",), "representation manifest")
-    representation_name = str(manifest["name"])
-    representation_format = manifest.get("format", manifest.get("representation_format"))
-    sources = manifest.get("sources")
-    repid: int | str
-    if representation_format is not None or sources is not None:
-        _require_manifest_fields(manifest, ("sources",), "representation creation manifest")
-        if representation_format is None:
-            raise ValueError("representation creation manifest is missing required field: format")
-        repid = manager.create_representation(
-            name=representation_name,
-            representation_format=representation_format,
-            sources=sources,
-            field_name=manifest.get("field_name"),
-            temporal_interpolation=manifest.get("temporal_interpolation", "none"),
-            parameter_correspondence=manifest.get("parameter_correspondence"),
-            metadata=manifest.get("metadata"),
-            replace=bool(manifest.get("replace", False) or replace),
-        )
-    else:
-        if replace:
-            raise ValueError("--replace requires format and sources in the representation manifest")
-        repid = representation_name
+def _manifest_variable_ref(value, label: str) -> VariableRef:
+    if not isinstance(value, dict):
+        raise TypeError(f"{label} must be an object with dataset and variable fields")
+    _require_manifest_fields(value, ("dataset", "variable"), label)
+    return VariableRef(str(value["dataset"]), str(value["variable"]))
 
-    for item in manifest.get("items", []):
-        if not isinstance(item, dict) or "dataset" not in item:
-            raise ValueError(f"Representation item requires dataset: {item!r}")
-        manager.append_representation_item(
-            representation=repid,
-            dataset=item["dataset"],
-            logical_time=item.get("logical_time"),
-            source_selections=item.get("source_selections"),
-            source_step=item.get("source_step"),
-            source_time=item.get("source_time"),
-            metrics=item.get("metrics"),
-            metadata=item.get("metadata"),
-            item_order=item.get("item_order"),
-        )
 
-    for metric in manifest.get("metrics", []):
-        if not isinstance(metric, dict):
-            raise ValueError(f"Representation metric must be an object: {metric!r}")
-        _require_manifest_fields(metric, ("name", "value"), "representation metric")
-        manager.add_representation_metric(
-            representation=repid,
-            name=metric["name"],
-            value=metric["value"],
-            units=metric.get("units"),
-            norm=metric.get("norm"),
-            relative=bool(metric.get("relative", False)),
-            metadata=metric.get("metadata"),
-        )
-    return int(repid) if isinstance(repid, int) else -1
+def _manifest_representation_of(value):
+    if value is None:
+        return None
+    if isinstance(value, dict) and {"dataset", "variable"}.issubset(value):
+        return _manifest_variable_ref(value, "representation_of")
+    if not isinstance(value, dict):
+        raise TypeError("representation_of must be a variable reference or a label mapping")
+    return {
+        str(label): _manifest_variable_ref(reference, f"representation_of.{label}")
+        for label, reference in value.items()
+    }
+
+
+def _apply_variable_manifest(manager: Manager, manifest: dict, append: bool = False) -> VariableRef:
+    _require_manifest_fields(manifest, ("dataset", "variable"), "variable manifest")
+    preview = manifest.get("preferred_preview")
+    return manager.add_variable(
+        dataset=manifest["dataset"],
+        variable=manifest["variable"],
+        chunks=manifest.get("chunks"),
+        representation_of=_manifest_representation_of(manifest.get("representation_of")),
+        representation_kind=manifest.get("representation_kind"),
+        representation_metadata=manifest.get("representation_metadata"),
+        source_steps=manifest.get("source_steps"),
+        preferred_preview=(_manifest_variable_ref(preview, "preferred_preview") if preview is not None else None),
+        append=bool(manifest.get("append", False) or append),
+    )
+
+
+def _apply_image_sequence_manifest(manager: Manager, manifest: dict, append: bool = False) -> VariableRef:
+    _require_manifest_fields(manifest, ("dataset", "variable", "images"), "image-sequence manifest")
+    preview = manifest.get("preferred_preview")
+    return manager.add_image_sequence(
+        dataset=manifest["dataset"],
+        variable=manifest["variable"],
+        images=manifest["images"],
+        representation_of=_manifest_representation_of(manifest.get("representation_of")),
+        source_steps=manifest.get("source_steps"),
+        representation_metadata=manifest.get("representation_metadata"),
+        store=bool(manifest.get("store", False)),
+        thumbnail=manifest.get("thumbnail"),
+        preferred_preview=(_manifest_variable_ref(preview, "preferred_preview") if preview is not None else None),
+        append=bool(manifest.get("append", False) or append),
+    )
 
 
 # pylint:disable = too-many-statements
@@ -1221,8 +722,6 @@ def main(args=None, prog=None):
         create_allowed = True
         if parser.args.command in (
             "info",
-            "representation",
-            "visualization-sequence",
             "add-archival-storage",
             "archived-replica",
             "time-series",
@@ -1240,60 +739,17 @@ def main(args=None, prog=None):
             info_data = manager.info(
                 parser.args.list_replicas, parser.args.list_files, parser.args.show_deleted, parser.args.show_checksum
             )
-            if parser.args.images:
-                print_image_associations(info_data)
-            else:
-                print_info(info_data)
+            print_info(info_data)
         elif parser.args.command == "data":
             manager.data(parser.args.files, parser.args.name)
         elif parser.args.command == "text":
             manager.text(parser.args.files, parser.args.name, parser.args.store)
-        elif parser.args.command == "image":
-            manager.image(parser.args.file, parser.args.name, parser.args.store, parser.args.thumbnail)
-        elif parser.args.command == "scalar-field":
-            scalar_data, scalar_metadata = _load_scalar_field_cli_input(parser.args)
-            manager.scalar_field_data(
-                scalar_data,
-                name=parser.args.name,
-                dtype=parser.args.dtype,
-                shape=parser.args.shape,
-                metadata=scalar_metadata,
-                layout=parser.args.layout,
-                compression=parser.args.compression,
-                encoding=parser.args.encoding,
-                replica_name=parser.args.replica_name,
-            )
-        elif parser.args.command == "gaussian-splat":
-            splat_data, splat_metadata = _load_gaussian_splat_cli_input(parser.args)
-            manager.gaussian_splat_data(
-                splat_data,
-                name=parser.args.name,
-                metadata=splat_metadata,
-                coordinate_space=parser.args.coordinate_space,
-                value_space=parser.args.value_space,
-                replica_name=parser.args.replica_name,
-            )
-        elif parser.args.command == "representation":
-            manifest = _load_json_object(parser.args.manifest, "representation manifest")
-            _apply_representation_manifest(manager, manifest, replace=parser.args.replace)
-        elif parser.args.command == "visualization-sequence":
-            manifest = _load_json_object(parser.args.manifest, "visualization sequence manifest")
-            _require_manifest_fields(
-                manifest,
-                ("name", "vis_type", "variables", "items"),
-                "visualization sequence manifest",
-            )
-            manager.visualization_sequence(
-                name=manifest["name"],
-                vis_type=manifest["vis_type"],
-                variables=manifest["variables"],
-                items=manifest["items"],
-                source_dataset=manifest.get("source_dataset"),
-                thumbnail_name=manifest.get("thumbnail_name"),
-                thumbnail_uuid=manifest.get("thumbnail_uuid"),
-                metadata=manifest.get("metadata"),
-                replace=bool(manifest.get("replace", False) or parser.args.replace),
-            )
+        elif parser.args.command == "variable":
+            manifest = _load_json_object(parser.args.manifest, "variable manifest")
+            _apply_variable_manifest(manager, manifest, append=parser.args.append)
+        elif parser.args.command == "image-sequence":
+            manifest = _load_json_object(parser.args.manifest, "image-sequence manifest")
+            _apply_image_sequence_manifest(manager, manifest, append=parser.args.append)
         elif parser.args.command == "delete":
             if parser.args.uuid is not None:
                 for uid in parser.args.uuid:

@@ -9,11 +9,8 @@ __accepted_commands__ = [
     "info",
     "data",
     "text",
-    "image",
-    "scalar-field",
-    "gaussian-splat",
-    "representation",
-    "visualization-sequence",
+    "variable",
+    "image-sequence",
     "add-archival-storage",
     "archived-replica",
     "time-series",
@@ -167,12 +164,6 @@ file:     [encryption key]  size  date  [cheksum]  filename
             help="List files embedded in campaign archive",
             action="store_true",
         )
-        parser_info.add_argument(
-            "-i",
-            "--images",
-            help="Print image datasets and their visualization associations",
-            action="store_true",
-        )
         parser_info.add_argument("-d", "--show-deleted", help="Show deleted entries", action="store_true")
         parser_info.add_argument("-c", "--show-checksum", help="Show checksums of files", action="store_true")
         parsers["info"] = parser_info
@@ -214,176 +205,24 @@ so be mindful about the size of the resulting archive. Text is stored compressed
         )
         parser_text.add_argument("--store", "-s", help="Store image in campaign", action="store_true")
 
-        # parser for the "image" command
-        parser_image = argparse.ArgumentParser(
-            prog=f"{prog} <archive> image",
+        parser_variable = argparse.ArgumentParser(
+            prog=f"{prog} <archive> variable",
             formatter_class=argparse.RawDescriptionHelpFormatter,
-            description="""
-Add an image file to the archive (remote reference by default).
-Multiple files with different resolutions can represent an image --name in the archive.
-The archive can '--store' directly the image file, or store a --thumbnail with X,Y size.
-""",
+            description="Create a logical variable or append chunks using a JSON manifest.",
         )
-        parsers["image"] = parser_image
-        parser_image.add_argument("file", help="image file")
-        parser_image.add_argument(
-            "--name",
-            "-n",
-            default=None,
-            help="Representation name in the campaign hierarchy",
-        )
-        parser_image.add_argument("--store", "-s", help="Store image in campaign", action="store_true")
-        parser_image.add_argument(
-            "--thumbnail",
-            nargs=2,
-            default=None,
-            type=int,
-            metavar=("x", "y"),
-            help="Store a resized image with resolution of x-by-y and refer to original",
-        )
+        parsers["variable"] = parser_variable
+        parser_variable.add_argument("manifest", help="JSON logical-variable manifest")
+        parser_variable.add_argument("--append", help="Append chunks to an existing variable", action="store_true")
 
-        # parser for the "scalar-field" command
-        parser_scalar_field = argparse.ArgumentParser(
-            prog=f"{prog} <archive> scalar-field",
+        parser_image_sequence = argparse.ArgumentParser(
+            prog=f"{prog} <archive> image-sequence",
             formatter_class=argparse.RawDescriptionHelpFormatter,
-            description="""
-Add a rank-2 scalar field to the archive. NumPy .npy inputs infer shape and
-dtype automatically unless overridden. Raw byte inputs require --shape and
---dtype so that the payload can be interpreted unambiguously.
-""",
+            description="Ingest an image sequence using a JSON manifest.",
         )
-        parsers["scalar-field"] = parser_scalar_field
-        parser_scalar_field.add_argument("file", help="raw scalar field file or NumPy .npy file")
-        parser_scalar_field.add_argument(
-            "--name",
-            "-n",
-            default=None,
-            help="Representation name in the campaign hierarchy",
-        )
-        parser_scalar_field.add_argument(
-            "--shape",
-            nargs=2,
-            default=None,
-            type=int,
-            metavar=("height", "width"),
-            help="Scalar field shape. Required for raw files; validates .npy array shape when supplied.",
-        )
-        parser_scalar_field.add_argument(
-            "--dtype",
-            default=None,
-            help="NumPy dtype for the scalar field. Required for raw files; converts .npy arrays when supplied.",
-        )
-        parser_scalar_field.add_argument(
-            "--layout",
-            default="row-major",
-            help="Scalar field memory layout. Currently only row-major is supported.",
-        )
-        parser_scalar_field.add_argument(
-            "--encoding",
-            default="raw",
-            help="Scalar field payload encoding. Currently only raw is supported.",
-        )
-        parser_scalar_field.add_argument(
-            "--compression",
-            default="none",
-            help="Scalar field payload compression. Currently only none is supported.",
-        )
-        parser_scalar_field.add_argument(
-            "--value-encoding",
-            default=None,
-            help="Scalar value representation. Currently only direct is supported.",
-        )
-        parser_scalar_field.add_argument(
-            "--metadata-json",
-            default=None,
-            metavar="file",
-            help="Optional JSON object with extra scalar field metadata.",
-        )
-        parser_scalar_field.add_argument(
-            "--replica-name",
-            default=None,
-            help="Optional replica name to store in the archive.",
-        )
-
-        # parser for the "gaussian-splat" command
-        parser_gaussian_splat = argparse.ArgumentParser(
-            prog=f"{prog} <archive> gaussian-splat",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            description="""
-Add one 2D scalar Gaussian-splat timestep to the archive. The input must
-be a NumPy .npz file containing centers, log_scales, angles, amplitudes,
-and bias arrays. Coordinate/value spaces and any required transforms are
-provided by --metadata-json or their explicit command-line options.
-""",
-        )
-        parsers["gaussian-splat"] = parser_gaussian_splat
-        parser_gaussian_splat.add_argument("file", help="NumPy .npz Gaussian-splat parameter file")
-        parser_gaussian_splat.add_argument(
-            "--name",
-            "-n",
-            default=None,
-            help="Representation item dataset name in the campaign hierarchy",
-        )
-        parser_gaussian_splat.add_argument(
-            "--metadata-json",
-            default=None,
-            metavar="file",
-            help="JSON object describing coordinate/value spaces, transforms, and optional provenance.",
-        )
-        parser_gaussian_splat.add_argument(
-            "--coordinate-space",
-            choices=("normalized", "physical"),
-            default=None,
-            help="Coordinate space for centers and scales; overrides metadata JSON.",
-        )
-        parser_gaussian_splat.add_argument(
-            "--value-space",
-            choices=("normalized", "physical"),
-            default=None,
-            help="Value space for amplitudes and bias; overrides metadata JSON.",
-        )
-        parser_gaussian_splat.add_argument(
-            "--replica-name",
-            default=None,
-            help="Optional replica name to store in the archive.",
-        )
-
-        # parser for the generic "representation" command
-        parser_representation = argparse.ArgumentParser(
-            prog=f"{prog} <archive> representation",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            description="""
-Create or append to a generic alternate data representation using a JSON
-manifest. A creation manifest includes name, format, and sources. An append
-manifest may contain only name and items when the representation already exists.
-""",
-        )
-        parsers["representation"] = parser_representation
-        parser_representation.add_argument("manifest", help="JSON representation manifest")
-        parser_representation.add_argument(
-            "--replace",
-            help="Replace an existing representation definition and all of its item associations",
-            action="store_true",
-        )
-
-        # parser for the "visualization-sequence" command
-        parser_vis_sequence = argparse.ArgumentParser(
-            prog=f"{prog} <archive> visualization-sequence",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            description="""
-Add or replace a visualization sequence from a JSON manifest. The manifest
-contains the same fields as the Python Manager.visualization_sequence() API:
-name, vis_type, variables, items, and optional source_dataset, thumbnail_name,
-thumbnail_uuid, metadata, and replace. Items must refer to fixed IMAGE datasets;
-scalar fields and Gaussian splats use the representation command.
-""",
-        )
-        parsers["visualization-sequence"] = parser_vis_sequence
-        parser_vis_sequence.add_argument("manifest", help="JSON visualization sequence manifest")
-        parser_vis_sequence.add_argument(
-            "--replace",
-            help="Replace an existing visualization sequence with the same name",
-            action="store_true",
+        parsers["image-sequence"] = parser_image_sequence
+        parser_image_sequence.add_argument("manifest", help="JSON image-sequence manifest")
+        parser_image_sequence.add_argument(
+            "--append", help="Append images to an existing sequence", action="store_true"
         )
 
         # parser for the "add-archival-storage" command
@@ -490,45 +329,21 @@ One may need to run upgrade several times to reach the newest format.
             del args.name
             del args.files
             del args.store
-        elif command == "image":
-            del args.name
-            del args.file
-            del args.store
-            del args.thumbnail
         elif command == "info":
             del args.show_deleted
             del args.show_checksum
             del args.list_replicas
             del args.list_files
-            del args.images
         elif command == "delete":
             del args.name
             del args.uuid
             del args.replica
-        elif command == "scalar-field":
-            del args.file
-            del args.name
-            del args.shape
-            del args.dtype
-            del args.layout
-            del args.encoding
-            del args.compression
-            del args.value_encoding
-            del args.metadata_json
-            del args.replica_name
-        elif command == "gaussian-splat":
-            del args.file
-            del args.name
-            del args.metadata_json
-            del args.coordinate_space
-            del args.value_space
-            del args.replica_name
-        elif command == "representation":
+        elif command == "variable":
             del args.manifest
-            del args.replace
-        elif command == "visualization-sequence":
+            del args.append
+        elif command == "image-sequence":
             del args.manifest
-            del args.replace
+            del args.append
         elif command == "add-archival-storage":
             del args.host
             del args.system

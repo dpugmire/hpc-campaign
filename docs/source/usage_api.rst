@@ -42,11 +42,10 @@ The [sub-command] argument can take one of the following values
 
 * **add_archival_storage** Register an archival location (tape system, https, s3)
 * **data** Add ADIOS2 or HDF5 files
-* **scalar_field_data** Add one structured scalar-field representation item
-* **gaussian_splat_data** Add one Gaussian-splat representation item
-* **create_representation** Relate alternate representation items to ground-truth variables
-* **append_representation_item** Append one explicitly mapped timestep
-* **image** Add images, embedded or remote optionally with an embedded thumbnail image
+* **add_variable** Add a primary variable or alternate representation
+* **add_image_sequence** Add an ordered image representation
+* **set_variable_relationships** Explicitly update immediate representation parents
+* **delete_variable** Delete a logical variable with relationship safeguards
 * **text** Add text files, embedded or just reference to remote file
 * **add_time_series** Organizing a series of individual data files as a single entry with extra dimension for time
 * **archived_replica** Create a replica of a dataset pointing to an archival storage location
@@ -111,133 +110,55 @@ Example usage:
   manager.data("data/heat.bp", name="heat")
   manager.data(["data/run_001.h5", "data/run_002.h5", "data/run_003.h5"])
 
-Additional option (`name="<NAME>"`) can specify the representation name for one dataset in the campaign hierarchy. The same option can be applied to the text and image sub-commands.
+The optional `name="<NAME>"` argument assigns the campaign dataset name.
 
-**3. image**
+**3. logical variables and image sequences**
 
-Add an image file to the archive. By default, only a remote reference is stored for image files but it can be stored (`store=True``) or a thumbnail with a smaller resolution can be stored (`thumbnail=[64, 64]`)
-
-Example usage:
-
-.. code-block:: python
-
-    manager.image("data/T0.png", name="T0")
-    manager.image("data/T1.png", name="T1", store=True)
-    manager.image("data/T2.png", name="T2", thumbnail=[64, 64])
-
-Additional options for images include:
-* `name="<NAME>"` representation name for the image in the campaign hierarchy
-
-**Derived visualizations**
-
-Use ``visualization`` when an image or image sequence is derived from variables
-in a data set already in the campaign. The method adds the image data and also
-records explicit metadata that links the visualization back to the source data
-set and variable uses. This is useful in notebooks where a user reads a
-variable, performs analysis, creates figures, and wants to save those figures
-back into the campaign.
-
-File-backed image inputs follow the same storage rule as ``image``: by default
-the campaign records a reference to the image file, and ``store=True`` embeds
-the image bytes in the archive. In-memory image inputs such as PNG/JPEG bytes,
-PIL Images, and matplotlib Figures have no external file path, so they require
-``store=True``.
-
-Example usage:
+Use ``add_variable`` for primary variables and all alternate
+representations. The returned ``VariableRef`` is the stable public identity.
 
 .. code-block:: python
 
-  manager.data("runs/run001/output.bp", name="run001/output.bp")
-
-  # png_frames can be paths, PNG/JPEG bytes, PIL Images, or matplotlib Figures.
-  # replace=True makes rerunning a notebook cell update the same visualization.
-  manager.visualization(
-      images=png_frames,
-      source_dataset="run001/output.bp",
-      name="density",
-      kind="heatmap",
-      color_by="rho",
-      steps=[0, 1, 2],
-      store=True,
-      replace=True,
+  pressure = manager.add_variable(dataset="output.bp", variable="pressure")
+  pressure_mgard = manager.add_variable(
+      dataset="output.bp",
+      variable="pressure-mgard-1e-4",
+      representation_of=pressure,
+      representation_kind="mgard",
   )
 
-  manager.visualization(
-      images=overlay_frames,
-      source_dataset="run001/output.bp",
-      name="density_current_overlay",
-      kind="heatmap-contour",
-      color_by="rho",
-      contour_by="current_z",
-      replace=True,
-  )
-
-  manager.visualization(
-      images=line_plot,
-      source_dataset="run001/output.bp",
-      name="mass_over_time",
-      kind="line-plot",
-      x_axis="time",
-      y_axis="mass",
-      replace=True,
-  )
-
-If ``name`` is a short token, the visualization sequence is stored under
-``<source_dataset>/visualizations/<name>``. For advanced use, pass
-``sequence_name`` to provide the exact sequence name. If image names are not
-provided explicitly, they are generated as children of the sequence name, using
-``steps`` when supplied.
-
-**Alternate scalar-data representations**
-
-``SCALAR_FIELD`` and ``GAUSSIAN_SPLAT`` are data representations, not rendered
-visualizations. Write each timestep with ``scalar_field_data`` or
-``gaussian_splat_data``, then use ``create_representation`` and
-``append_representation_item`` to identify its ground-truth dataset, variable,
-source step, and physical time.
+Chunked variables reference existing campaign payload datasets. Source steps
+map the ordered chunks to their immediate parents.
 
 .. code-block:: python
 
-  manager.gaussian_splat_data(
-      {
-          "centers": centers,
-          "log_scales": log_scales,
-          "angles": angles,
-          "amplitudes": amplitudes,
-          "bias": bias,
-      },
-      name="splats/pressure.000010.raw",
-      coordinate_space="normalized",
-      coordinate_transform={
-          "type": "affine",
-          "physical_from_stored": {
-              "scale": [4.4, -5.0],
-              "offset": [0.2, 2.5],
-          },
-      },
-      value_space="normalized",
-      value_transform={
-          "type": "affine",
-          "physical_from_stored": {"scale": 0.02388, "offset": 0.00184},
-      },
+  scalar = manager.add_variable(
+      dataset="representations",
+      variable="pressure-scalar-field",
+      chunks=scalar_payload_names,
+      representation_of=pressure,
+      representation_kind="scalar_field",
+      source_steps=range(0, 1000, 5),
   )
 
-  repid = manager.create_representation(
-      name="output/representations/pressure/gaussian",
-      representation_format="GAUSSIAN_SPLAT",
-      sources=[{"dataset": "output", "variable": "pressure"}],
-      temporal_interpolation="linear",
-  )
-  manager.append_representation_item(
-      repid,
-      "splats/pressure.000010.raw",
-      source_step=10,
-      source_time=0.5,
+``add_image_sequence`` is the image-ingestion convenience API. Paths, globs,
+bytes, PIL images, and matplotlib figures are supported. In-memory images
+require ``store=True``.
+
+.. code-block:: python
+
+  pressure_images = manager.add_image_sequence(
+      dataset="visualizations",
+      variable="pressure-volume",
+      images="rendered/pressure/frame*.png",
+      representation_of=pressure_mgard,
+      source_steps=range(0, 1000, 5),
+      representation_metadata={"visualization": "volume_rendering"},
+      thumbnail=(256, 256),
   )
 
-See :doc:`data_representations` for the conceptual model, exact Gaussian binary
-layout and evaluation formula, multi-source mappings, metrics, CLI manifests,
-and future compatibility considerations.
+See :doc:`data_representations` for graph, chunk, append, query, and deletion
+semantics.
 
 **4. text**
 
@@ -257,7 +178,7 @@ Example usage:
 
 
 Additional options for text include:
-* `name="<NAME>"` representation name for the image in the campaign hierarchy
+* `name="<NAME>"` campaign dataset name for the text payload
 * `store=True` stores the text file directly in the campaign archive instead of just a reference.
 
 **5. add_time_series**
@@ -423,7 +344,7 @@ Configuration:
     manager.text("runs/input-configuration.json", store=True)
     manager.data(["runs/simulation-output.bp" ,"runs/simulation-chekpoint.bp"])
     manager.data("analysis/pdf.bp")
-    manager.image("analysis/plot-2d.png", store=True)
+    manager.add_image_sequence(\n        dataset="analysis",\n        variable="plot-2d",\n        images="analysis/plot-2d.png",\n        store=True,\n    )
 
     info_data = manager.info(True, False, False, False)
     output = format_info(info_data)

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from PIL import Image
+
 from hpc_campaign.info import format_info
 from hpc_campaign.ls import ls
 from hpc_campaign.manager import Manager
@@ -7,33 +9,33 @@ from hpc_campaign.rm import rm
 
 repo_root = Path(__file__).resolve().parents[1]
 campaign_store = repo_root
-data_dir = Path("data")
+data_dir = repo_root / "data"
 
 print(f"campaign_store = {repo_root}")
 print(f"data_dir = {data_dir}")
 
 api_archive = Path("example_api.aca")  #  will find it in repo_root
-heat_dataset = data_dir / "heat.bp"
+sample_dataset = data_dir / "onearray.h5"
 readme_file = data_dir / "readme"
-image_files = [
-    data_dir / "T00000.png",
-    data_dir / "T00001.png",
-    data_dir / "T00002.png",
-]
-
-info_outputs: dict[str, str] = {}
+image_frames = [Image.new("RGB", (128, 96), color=color) for color in ("midnightblue", "royalblue", "lightskyblue")]
 
 
 def main():
     manager = Manager(archive=str(api_archive), campaign_store=str(campaign_store))
     manager.open(create=True, truncate=True)
     assert repo_root.joinpath(api_archive).exists()
-    manager.data(str(heat_dataset), name="heat")
-    # Path, and list of str and Path are valid arguments
-    manager.data([data_dir / "onearray.h5"])
-    manager.image(str(image_files[0]), name="T0")
-    manager.image(str(image_files[1]), name="T1", store=True)
-    manager.image(str(image_files[2]), name="T2", thumbnail=[64, 64])
+    manager.data(sample_dataset, name="output")
+    temperature = manager.add_variable(dataset="output", variable="data")
+    manager.add_image_sequence(
+        dataset="images",
+        variable="temperature",
+        images=image_frames,
+        representation_of=temperature,
+        source_steps=[0, 1, 2],
+        representation_metadata={"visualization": "temperature colormap"},
+        store=True,
+        thumbnail=[64, 64],
+    )
     manager.text(str(readme_file), name="readme", store=True)
 
     host_id, dir_id, archive_id = manager.add_archival_storage(
@@ -41,9 +43,9 @@ def main():
     )
     print(f"Archive storage added: host id = {host_id}, directory id = {dir_id} archive id = {archive_id}")
 
-    # add a replica of the heat.bp located in the archival location
+    # add a replica of onearray.h5 located in the archival location
     # note that there is no such file, we are faking this record
-    manager.archived_replica("heat", dir_id, archiveid=archive_id, newpath="archivedheat.bp")
+    manager.archived_replica("output", dir_id, archiveid=archive_id, newpath="archived-onearray.h5")
 
     info_data = manager.info(True, False, False, False)
     output = format_info(info_data)
