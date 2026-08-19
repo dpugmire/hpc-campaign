@@ -35,12 +35,13 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "PyYAML >= 6",
-    "paramiko >= 3.5",
-    "PyNaCl >= 1.5",
+    "paramiko >= 5.0.0, < 6",
+    "cryptography >= 49.0.0",
+    "PyNaCl >= 1.6.2",
     "adios2 (>=2.12.0.1001)",
     "redis >= 5",
     "h5py >= 3.10",
-    "pillow >= 12.1.1"
+    "pillow >= 12.3.0"
 ]
 
 [project.urls]
@@ -86,9 +87,9 @@ exclude = [
 dev = [
     "mypy (>=1.19.1)",
     "ruff (>=0.15.6)",
-    "pytest (>=9.0.1,<10.0.0)",
+    "pytest (>=9.0.3,<10.0.0)",
     "types-pyyaml (>=6.0.12.20250915,<7.0.0.0)",
-    "types-paramiko (>=4.0.0.20250822,<5.0.0.0)",
+    "types-paramiko (>=5.0.0)",
     "types-python-dateutil (>=2.9.0.20251115,<3.0.0.0)",
     "pylint (>=4.0.4,<5.0.0)",
     "matplotlib (>=3.10.0)",
