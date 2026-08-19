@@ -6,8 +6,8 @@ project = "HPC Campaign Management"
 copyright = "2024, ORNL ADIOS Team"
 author = "Norbert Podhorszki"
 
-release = "0.7"
-version = "0.7.0"
+version = "0.7"
+release = "0.7.1"
 
 # -- General configuration
 

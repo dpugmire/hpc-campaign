@@ -7,7 +7,7 @@ requires = [
 
 [project]
 name = "hpc-campaign"
-version = "0.7.0"
+version = "0.7.1"
 description = "Campaign management scripts for remote data access"
 readme = "README.md"
 authors = [
