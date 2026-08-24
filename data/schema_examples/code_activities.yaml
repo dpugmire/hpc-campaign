@@ -1,0 +1,32 @@
+schema_version: 2
+name: code_activities
+
+files:
+  output:
+    role: static
+    path: output.bp
+
+# The action vocabulary is fixed by hpc_campaign. Profiles constrain the
+# optional action_spec keys for selected actions; they do not define new ones.
+activity_profiles:
+  visualization:
+    action_spec:
+      # Placeholder names demonstrate required and optional-key validation
+      # without claiming a domain-wide visualization vocabulary.
+      required: [required_key1, required_key2]
+      optional: [optional_key1, optional_key2]
+      allow_additional: true
+
+  reduction:
+    action_spec:
+      # Reduction libraries are action details. No property is universally
+      # required yet, so method remains optional.
+      required: []
+      optional: [method, error_bound, error_bound_type]
+      allow_additional: false
+
+  quantity_of_interest:
+    action_spec:
+      required: []
+      optional: [quantity, region]
+      allow_additional: true

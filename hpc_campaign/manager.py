@@ -8,45 +8,78 @@
 # pylint: disable=too-many-positional-arguments
 
 import argparse
+import glob
 import json
-import math
+import re
 import sqlite3
 import sys
 import zlib
+from hashlib import sha1
 from io import BytesIO
+from os import getcwd
 from os.path import exists
 from pathlib import Path
 from time import time_ns
+from typing import Any, Mapping
 
 import nacl.secret
-import numpy as np
 import yaml
 from PIL import Image as PILImage
 
-from .info import InfoResult, collect_info, print_image_associations, print_info
+from .info import InfoResult, collect_info, print_info
 from .key import read_key
 from .manager_args import ArgParser
 from .manager_funcs import (
     add_archival_storage,
-    add_image_data,
-    add_scalar_field_data,
+    add_directory,
+    add_host_name,
+    add_key_id,
     add_time_series,
-    add_visualization_sequence,
     archive_dataset,
     check_archival_storage_system_name,
     create_tables,
     delete_dataset,
     delete_replica,
     delete_time_series,
+    get_host_name,
+    process_image,
+    process_image_data,
     set_default_args,
     update,
 )
-from .schema import SchemaInterpretationError, interpret_campaign_schema_layout
+from .schema import (
+    SchemaInterpretationError,
+    interpret_activity_profiles,
+    interpret_campaign_schema_layout,
+    validate_action_spec,
+    validate_campaign_activities,
+)
 from .upgrade import upgrade_aca
 from .utils import (
     check_campaign_store,
     sql_commit,
     sql_error_list,
+)
+from .variables import (
+    DEFAULT_RUN,
+    ActivityResult,
+    VariableDeleteImpact,
+    VariableRef,
+    VariableSpec,
+    variable_delete_impact,
+    variable_transaction,
+)
+from .variables import (
+    add_activity as add_provenance_activity,
+)
+from .variables import (
+    add_variable as add_logical_variable,
+)
+from .variables import (
+    delete_variable as delete_logical_variable,
+)
+from .variables import (
+    set_primary_variable as set_logical_primary_variable,
 )
 
 CURRENT_TIME = time_ns()
@@ -122,6 +155,10 @@ class Manager:  # pylint: disable=too-many-public-methods
 
         self.con.commit()
         self.con.execute("VACUUM;")
+        # PRAGMA foreign_keys is connection-local. Truncation temporarily turns
+        # it off so tables can be dropped, then must restore it for the newly
+        # created provenance constraints on this same Manager session.
+        self.con.execute("PRAGMA foreign_keys = ON;")
 
     def open(self, create=False, truncate=False):
         """
@@ -135,6 +172,7 @@ class Manager:  # pylint: disable=too-many-public-methods
 
         self.con = sqlite3.connect(self.args.campaign_file_name)
         self.con.row_factory = sqlite3.Row
+        self.con.execute("PRAGMA foreign_keys = ON")
         self.cur = self.con.cursor()
         self.connected = True
 
@@ -202,6 +240,13 @@ class Manager:  # pylint: disable=too-many-public-methods
             raise FileNotFoundError(f"Schema file not found: {schema_path}")
         if schema_path.stat().st_size == 0:
             raise ValueError(f"Schema file is empty: {schema_path}")
+        schema = self._parse_campaign_schema(schema_path.read_text(encoding="utf-8"), str(schema_path))
+        profiles = interpret_activity_profiles(schema)
+        if not self.connected:
+            self.open(create=True, truncate=False)
+        # Validate existing activities before storing the candidate. A rejected
+        # profile must not replace a schema under which the archive was valid.
+        validate_campaign_activities(profiles, self._stored_activities())
         cmd_args = self._build_command_args(
             "text",
             {
@@ -211,27 +256,33 @@ class Manager:  # pylint: disable=too-many-public-methods
                 "filename_as_recorded": _CAMPAIGN_SCHEMA_NAME,
             },
         )
-        if not self.connected:
-            self.open(create=True, truncate=False)
         update(cmd_args, self.cur, self.con)
 
     def validate_schema(self) -> dict:
         if not self.connected:
             self.open(create=False, truncate=False)
 
-        schema_text = self._read_embedded_schema_text()
-        try:
-            schema = yaml.safe_load(schema_text)
-        except yaml.YAMLError as exc:
-            raise SchemaInterpretationError(f"Invalid {_CAMPAIGN_SCHEMA_NAME}: {exc}") from exc
-        if not isinstance(schema, dict):
-            raise SchemaInterpretationError(f"{_CAMPAIGN_SCHEMA_NAME} must contain a mapping")
-
-        return interpret_campaign_schema_layout(
+        schema = self._parse_campaign_schema(self._read_embedded_schema_text(), _CAMPAIGN_SCHEMA_NAME)
+        profiles = interpret_activity_profiles(schema)
+        layout = interpret_campaign_schema_layout(
             schema,
             datasets=self._live_dataset_names(),
             timeseries=self._time_series_membership(),
         )
+        layout["activity_profiles"] = profiles
+        layout["activity_validation"] = validate_campaign_activities(profiles, self._stored_activities())
+        return layout
+
+    @staticmethod
+    def _parse_campaign_schema(schema_text: str, source_name: str) -> dict:
+        """Parse one schema and preserve a useful source name in diagnostics."""
+        try:
+            schema = yaml.safe_load(schema_text)
+        except yaml.YAMLError as exc:
+            raise SchemaInterpretationError(f"Invalid {source_name}: {exc}") from exc
+        if not isinstance(schema, dict):
+            raise SchemaInterpretationError(f"{source_name} must contain a mapping")
+        return schema
 
     def _read_embedded_schema_text(self) -> str:
         row = self.cur.execute(
@@ -274,7 +325,7 @@ class Manager:  # pylint: disable=too-many-public-methods
             """
             select name
             from dataset
-            where deltime = 0 and name != ?
+            where deltime = 0 and name != ? and fileformat != 'VARIABLES'
             order by name
             """,
             (_CAMPAIGN_SCHEMA_NAME,),
@@ -297,99 +348,67 @@ class Manager:  # pylint: disable=too-many-public-methods
             membership.setdefault(str(row["timeseries_name"]), []).append(str(row["dataset_name"]))
         return membership
 
-    def image(
-        self,
-        file_path: str | Path,
-        name: str | None = None,
-        store: bool = False,
-        thumbnail: list[int] | tuple[int, int] | None = None,
-        verbose: int | None = None,
-    ):
-        file_path = str(file_path)
-        thumb_value = None
-        if thumbnail is not None:
-            thumb_value = [int(thumbnail[0]), int(thumbnail[1])]
-        cmd_args = self._build_command_args(
-            "image",
-            {
-                "file": file_path,
-                "name": name,
-                "store": store,
-                "thumbnail": thumb_value,
-                "verbose": self.args.verbose if verbose is None else int(verbose),
-            },
-        )
-        if not self.connected:
-            self.open(create=True, truncate=False)
-        update(cmd_args, self.cur, self.con)
+    @staticmethod
+    def _decode_action_spec(raw_spec: str | None, identity: str):
+        if raw_spec is None:
+            return None
+        try:
+            return json.loads(raw_spec)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise SchemaInterpretationError(f"{identity}: stored action_spec is not valid JSON") from exc
 
-    def image_data(
-        self,
-        data: bytes,
-        image_format: str,
-        name: str | None = None,
-        thumbnail: list[int] | tuple[int, int] | None = None,
-        replica_name: str | None = None,
-        store: bool = True,
-        verbose: int | None = None,
-    ):
-        if not store:
-            raise ValueError("image_data requires store=True because in-memory images have no external replica path")
+    def _stored_activities(self) -> list[tuple[str, str, Any]]:
+        """Read the minimal activity fields needed for profile checks."""
+        table = self.cur.execute("select 1 from sqlite_master where type = 'table' and name = 'activity'").fetchone()
+        if table is None:
+            return []
+        rows = self.cur.execute(
+            "select a.uuid, kind.name as action, spec.metadata as action_spec "
+            "from activity as a join activity_kind as kind on kind.kindid = a.kindid "
+            "left join action_spec as spec on spec.specid = a.specid order by a.activityid"
+        ).fetchall()
+        return [
+            (
+                str(row["uuid"]),
+                str(row["action"]),
+                self._decode_action_spec(row["action_spec"], f"activity {row['uuid']}"),
+            )
+            for row in rows
+        ]
 
-        thumb_value = None
-        if thumbnail is not None:
-            thumb_value = [int(thumbnail[0]), int(thumbnail[1])]
-        cmd_args = self._build_command_args(
-            "image_data",
-            {
-                "image_data": bytes(data),
-                "image_format": image_format,
-                "name": name,
-                "thumbnail": thumb_value,
-                "replica_name": replica_name,
-                "store": store,
-                "verbose": self.args.verbose if verbose is None else int(verbose),
-            },
-        )
-        if not self.connected:
-            self.open(create=True, truncate=False)
-        add_image_data(cmd_args, self.cur, self.con)
+    def _stored_activity_profiles(self) -> dict[str, dict[str, Any]] | None:
+        """Return active profiles, treating an absent schema as unconstrained."""
+        try:
+            schema_text = self._read_embedded_schema_text()
+        except FileNotFoundError:
+            return None
+        schema = self._parse_campaign_schema(schema_text, _CAMPAIGN_SCHEMA_NAME)
+        return interpret_activity_profiles(schema)
 
-    def scalar_field_data(
+    def _validate_action_write(
         self,
-        data,
-        name: str | None = None,
-        dtype: str | None = None,
-        shape: list[int] | tuple[int, int] | None = None,
-        metadata=None,
-        layout: str = "row-major",
-        compression: str = "none",
-        encoding: str = "raw",
-        replica_name: str | None = None,
-        verbose: int | None = None,
-    ):
-        payload, scalar_metadata = self._coerce_scalar_field_input(
-            data=data,
-            dtype=dtype,
-            shape=shape,
-            metadata=metadata,
-            layout=layout,
-            compression=compression,
-            encoding=encoding,
-        )
-        cmd_args = self._build_command_args(
-            "scalar_field_data",
-            {
-                "scalar_field_data": payload,
-                "scalar_field_metadata": scalar_metadata,
-                "name": name,
-                "replica_name": replica_name,
-                "verbose": self.args.verbose if verbose is None else int(verbose),
-            },
-        )
-        if not self.connected:
-            self.open(create=True, truncate=False)
-        add_scalar_field_data(cmd_args, self.cur, self.con)
+        action: str,
+        action_spec,
+        *,
+        append_output: VariableRef | None = None,
+    ) -> None:
+        """Validate the effective action specification before mutation."""
+        profiles = self._stored_activity_profiles()
+        effective_spec = action_spec
+        if append_output is not None and action_spec is None:
+            row = self.cur.execute(
+                "select spec.metadata as action_spec from logical_variable as lv "
+                "join campaign_run as run on run.runid = lv.runid "
+                "join dataset as d on d.rowid = lv.datasetid "
+                "join activity_output as output on output.variableid = lv.variableid "
+                "join activity as a on a.activityid = output.activityid "
+                "left join action_spec as spec on spec.specid = a.specid "
+                "where run.name = ? and d.name = ? and d.deltime = 0 and lv.name = ?",
+                (append_output.run, append_output.dataset, append_output.variable),
+            ).fetchone()
+            if row is not None:
+                effective_spec = self._decode_action_spec(row["action_spec"], "existing activity")
+        validate_action_spec(action, effective_spec, profiles)
 
     def delete_uuid(self, uuid: str):
         if not self.connected:
@@ -472,126 +491,215 @@ class Manager:  # pylint: disable=too-many-public-methods
             self.open(create=True, truncate=False)
         add_time_series(cmd_args, self.cur, self.con)
 
-    def visualization_sequence(
+    def add_variable(
         self,
-        name: str,
-        vis_type: str,
-        variables,
-        items,
-        source_dataset: str | None = None,
-        thumbnail_name: str | None = None,
-        thumbnail_uuid: str | None = None,
-        metadata=None,
-        replace: bool = False,
-    ) -> int:
-        cmd_args = self._build_command_args(
-            "visualization_sequence",
-            {
-                "name": name,
-                "vis_type": vis_type,
-                "variables": variables,
-                "items": items,
-                "source_dataset": source_dataset,
-                "thumbnail_name": thumbnail_name,
-                "thumbnail_uuid": thumbnail_uuid,
-                "metadata": metadata,
-                "replace": replace,
-            },
-        )
+        *,
+        dataset: str,
+        variable: str,
+        run: str = DEFAULT_RUN,
+        definition: str | None = None,
+        chunks=None,
+        primary: bool = False,
+        preferred_preview: VariableRef | None = None,
+        append: bool = False,
+    ) -> VariableRef:
+        """Register a source data product or append chunks to one."""
         if not self.connected:
             self.open(create=True, truncate=False)
-        return add_visualization_sequence(cmd_args, self.cur, self.con)
-
-    def visualization(
-        self,
-        images,
-        vis_type: str | None = None,
-        variables=None,
-        source_dataset: str | None = None,
-        name: str | None = None,
-        sequence_name: str | None = None,
-        image_names: str | list[str] | None = None,
-        steps: list[int] | tuple[int, ...] | None = None,
-        image_format: str | None = None,
-        thumbnail: list[int] | tuple[int, int] | None = None,
-        thumbnail_image: int = 0,
-        store: bool = False,
-        metadata=None,
-        replace: bool = False,
-        kind: str | None = None,
-        variable: str | None = None,
-        color_by: str | None = None,
-        contour_by: str | None = None,
-        streamline_by=None,
-        x_axis: str | None = None,
-        y_axis=None,
-        verbose: int | None = None,
-    ) -> int:
-        image_inputs = self._normalize_visualization_images(images)
-        if not image_inputs:
-            raise ValueError("visualization requires at least one image")
-
-        resolved_vis_type = self._resolve_visualization_kind(kind, vis_type)
-        variable_specs = self._build_visualization_variable_specs(
-            variables=variables,
+        return add_logical_variable(
+            self.cur,
+            self.con,
+            dataset=dataset,
             variable=variable,
-            color_by=color_by,
-            contour_by=contour_by,
-            streamline_by=streamline_by,
-            x_axis=x_axis,
-            y_axis=y_axis,
-            source_dataset=source_dataset,
-        )
-        sequence_name = self._resolve_visualization_sequence_name(
-            source_dataset=source_dataset,
-            name=name,
-            sequence_name=sequence_name,
-            variables=variable_specs,
-        )
-        logical_image_names = self._resolve_visualization_image_names(
-            image_inputs=image_inputs,
-            sequence_name=sequence_name,
-            image_names=image_names,
-            steps=steps,
-            image_format=image_format,
+            run=run,
+            definition=definition,
+            chunks=chunks,
+            primary=primary,
+            preferred_preview=preferred_preview,
+            append=append,
         )
 
-        if not 0 <= int(thumbnail_image) < len(image_inputs):
-            raise ValueError("thumbnail_image index is out of range")
+    def set_primary_variable(self, variable: VariableRef) -> None:
+        """Bind an existing data product as its definition's primary value."""
+        if not self.connected:
+            self.open(create=True, truncate=False)
+        set_logical_primary_variable(self.cur, self.con, variable)
 
-        image_verbose = int(self.args.verbose if verbose is None else verbose)
-        for idx, image_input in enumerate(image_inputs):
-            logical_name = logical_image_names[idx]
-            if self._is_path_like_image(image_input):
-                self.image(
-                    str(image_input),
-                    name=logical_name,
-                    store=store,
-                    thumbnail=thumbnail,
-                    verbose=image_verbose,
+    def add_activity(
+        self,
+        *,
+        action: str,
+        inputs: Mapping[str, VariableRef],
+        outputs: Mapping[str, VariableSpec | Mapping[str, Any]],
+        action_spec: Mapping[str, Any] | None = None,
+        source_steps=None,
+    ) -> ActivityResult:
+        """Atomically record an action, its inputs, and its generated outputs."""
+        if not self.connected:
+            self.open(create=True, truncate=False)
+
+        append_output = None
+        if len(outputs) == 1:
+            output = next(iter(outputs.values()))
+            if isinstance(output, VariableSpec) and output.append:
+                append_output = VariableRef(output.run, output.dataset, output.variable)
+            elif isinstance(output, Mapping) and output.get("append"):
+                append_output = VariableRef(
+                    str(output.get("run", DEFAULT_RUN)),
+                    str(output.get("dataset", "")),
+                    str(output.get("variable", "")),
                 )
-            else:
-                image_bytes, resolved_format = self._coerce_image_input(image_input, image_format)
-                self.image_data(
-                    image_bytes,
-                    resolved_format,
-                    name=logical_name,
-                    thumbnail=thumbnail,
-                    replica_name=f"generated/{Path(logical_name).name}",
-                    store=store,
-                    verbose=image_verbose,
-                )
-
-        return self.visualization_sequence(
-            name=sequence_name,
-            vis_type=resolved_vis_type,
-            variables=variable_specs,
-            items=[{"type": "IMAGE", "name": logical_name} for logical_name in logical_image_names],
-            source_dataset=source_dataset,
-            thumbnail_name=logical_image_names[int(thumbnail_image)],
-            metadata=metadata,
-            replace=replace,
+        self._validate_action_write(action, action_spec, append_output=append_output)
+        return add_provenance_activity(
+            self.cur,
+            self.con,
+            action=action,
+            inputs=inputs,
+            outputs=outputs,
+            action_spec=action_spec,
+            source_steps=source_steps,
         )
+
+    def variable_delete_impact(self, variable: VariableRef) -> VariableDeleteImpact:
+        """Report variables affected by deleting a logical variable."""
+        if not self.connected:
+            self.open(create=True, truncate=False)
+        return variable_delete_impact(self.cur, variable)
+
+    def delete_variable(self, variable: VariableRef, *, cascade: bool = False) -> VariableDeleteImpact:
+        """Delete a logical variable and optionally its downstream products."""
+        if not self.connected:
+            self.open(create=True, truncate=False)
+        return delete_logical_variable(self.cur, self.con, variable, cascade=cascade)
+
+    def add_image_sequence(
+        self,
+        *,
+        dataset: str,
+        variable: str,
+        images,
+        inputs: Mapping[str, VariableRef],
+        run: str = DEFAULT_RUN,
+        definition: str | None = None,
+        source_steps=None,
+        action_spec: Mapping[str, Any] | None = None,
+        store: bool = False,
+        thumbnail: list[int] | tuple[int, int] | None = None,
+        preferred_preview: VariableRef | None = None,
+        append: bool = False,
+    ) -> VariableRef:
+        """Ingest images and record the visualization activity that made them."""
+        if not self.connected:
+            self.open(create=True, truncate=False)
+
+        # Validate before image ingestion so a profile error cannot leave
+        # payload datasets behind.
+        append_output = VariableRef(run, dataset, variable) if append else None
+        self._validate_action_write(
+            "visualization",
+            action_spec,
+            append_output=append_output,
+        )
+
+        image_inputs = self._expand_image_sequence_inputs(images)
+        if not image_inputs:
+            action = "append" if append else "create"
+            raise ValueError(f"add_image_sequence requires one or more images to {action} a sequence")
+        descriptors = [self._describe_image_sequence_input(image) for image in image_inputs]
+        self._validate_image_sequence_descriptors(descriptors)
+        if append:
+            existing_signature = self._existing_image_sequence_signature(run, dataset, variable)
+            self._validate_image_sequence_append(descriptors[0], existing_signature)
+        if not store and any(descriptor["data"] is not None for descriptor in descriptors):
+            raise ValueError("In-memory images require store=True because they have no external replica path")
+
+        thumb_value = None
+        if thumbnail is not None:
+            if len(thumbnail) != 2:
+                raise ValueError("thumbnail must contain [width, height]")
+            thumb_value = [int(thumbnail[0]), int(thumbnail[1])]
+            if any(value <= 0 for value in thumb_value):
+                raise ValueError("thumbnail dimensions must be positive")
+
+        payload_names: list[str] = []
+        with variable_transaction(self.con, "image_sequence_write"):
+            long_host_name, short_host_name = get_host_name(self.args)
+            verbose = bool(self.args.verbose)
+            host_id = add_host_name(long_host_name, short_host_name, self.cur, verbose=verbose)
+            key_id = add_key_id(self.args.encryption_key_id, self.cur, verbose=verbose)
+            rootdir = getcwd()
+            dir_id = add_directory(host_id, rootdir, self.cur, verbose=verbose)
+
+            run_token = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(run)).strip("_") or "run"
+            variable_token = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(variable)).strip("_") or "variable"
+            for descriptor in descriptors:
+                suffix = "." + str(descriptor["format"]).lower().replace("jpeg", "jpg")
+                payload_name = (
+                    f"{dataset}/.variable-payloads/{run_token}/{variable_token}/{descriptor['identity']}{suffix}"
+                )
+                payload_names.append(payload_name)
+                if descriptor["path"] is not None:
+                    cmd_args = self._build_command_args(
+                        "image",
+                        {
+                            "file": str(descriptor["path"]),
+                            "name": payload_name,
+                            "store": bool(store),
+                            "thumbnail": thumb_value,
+                            "verbose": self.args.verbose,
+                        },
+                    )
+                    process_image(
+                        cmd_args,
+                        self.cur,
+                        host_id,
+                        dir_id,
+                        key_id,
+                        long_host_name + rootdir,
+                        rootdir,
+                    )
+                else:
+                    image_format = str(descriptor["format"])
+                    cmd_args = self._build_command_args(
+                        "image_data",
+                        {
+                            "image_data": descriptor["data"],
+                            "image_format": image_format,
+                            "name": payload_name,
+                            "thumbnail": thumb_value,
+                            "replica_name": f"generated/{descriptor['identity']}{suffix}",
+                            "store": True,
+                            "verbose": self.args.verbose,
+                        },
+                    )
+                    process_image_data(
+                        cmd_args,
+                        self.cur,
+                        host_id,
+                        dir_id,
+                        key_id,
+                        long_host_name + rootdir,
+                        rootdir,
+                    )
+
+            result = self.add_activity(
+                action="visualization",
+                inputs=inputs,
+                outputs={
+                    "result": VariableSpec(
+                        run=run,
+                        dataset=dataset,
+                        variable=variable,
+                        definition=definition,
+                        chunks=payload_names,
+                        preferred_preview=preferred_preview,
+                        append=append,
+                    )
+                },
+                action_spec=action_spec,
+                source_steps=source_steps,
+            )
+            return result.outputs["result"]
 
     def upgrade(self) -> str:
         if not self.connected:
@@ -604,15 +712,131 @@ class Manager:  # pylint: disable=too-many-public-methods
             return [str(files)]
         return [str(entry) for entry in files]
 
-    def _normalize_visualization_images(self, images):
-        if isinstance(images, (str, Path, bytes, bytearray, memoryview, PILImage.Image)):
-            return [images]
-        if self._is_matplotlib_figure(images):
-            return [images]
-        return list(images)
+    @staticmethod
+    def _natural_path_key(path: str | Path) -> list[tuple[int, str | int]]:
+        parts = re.split(r"(\d+)", str(path).casefold())
+        return [(1, int(part)) if part.isdigit() else (0, part) for part in parts]
 
-    def _is_path_like_image(self, image) -> bool:
-        return isinstance(image, (str, Path))
+    def _expand_image_sequence_inputs(self, images) -> list:
+        if isinstance(images, (str, Path, bytes, bytearray, memoryview, PILImage.Image)):
+            raw_inputs: list[Any] = [images]
+        elif self._is_matplotlib_figure(images):
+            raw_inputs = [images]
+        else:
+            raw_inputs = list(images)
+
+        expanded: list[Any] = []
+        for image in raw_inputs:
+            if not isinstance(image, (str, Path)):
+                expanded.append(image)
+                continue
+            path_text = str(image)
+            if glob.has_magic(path_text):
+                matches = sorted(glob.glob(path_text), key=self._natural_path_key)
+                if not matches:
+                    raise ValueError(f"Image pattern matched no files: {path_text}")
+                expanded.extend(Path(match) for match in matches)
+            else:
+                expanded.append(Path(image))
+        return expanded
+
+    def _describe_image_sequence_input(self, image) -> dict:
+        if isinstance(image, (str, Path)):
+            path = Path(image)
+            if not path.is_file():
+                raise FileNotFoundError(f"Image file not found: {path}")
+            with PILImage.open(path) as opened:
+                opened.load()
+                image_format = str(opened.format or "").upper()
+                if not image_format:
+                    raise ValueError(f"Could not determine image encoding: {path}")
+                size = tuple(int(value) for value in opened.size)
+                mode = str(opened.mode)
+            identity = sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:24]
+            return {
+                "path": path,
+                "data": None,
+                "format": image_format,
+                "size": size,
+                "mode": mode,
+                "identity": identity,
+            }
+
+        image_data, image_format = self._coerce_image_input(image, None)
+        try:
+            with PILImage.open(BytesIO(image_data)) as opened:
+                opened.load()
+                detected_format = str(opened.format or image_format).upper()
+                size = tuple(int(value) for value in opened.size)
+                mode = str(opened.mode)
+        except Exception as exc:
+            raise ValueError("Invalid in-memory image payload") from exc
+        identity = sha1(image_data).hexdigest()[:24]
+        return {
+            "path": None,
+            "data": image_data,
+            "format": detected_format,
+            "size": size,
+            "mode": mode,
+            "identity": identity,
+        }
+
+    @staticmethod
+    def _validate_image_sequence_descriptors(descriptors: list[dict]) -> None:
+        first = descriptors[0]
+        first_width, first_height = first["size"]
+        for descriptor in descriptors[1:]:
+            if descriptor["size"] != first["size"]:
+                raise ValueError("All images in a sequence must have the same resolution and aspect ratio")
+            if descriptor["format"] != first["format"]:
+                raise ValueError("All images in a sequence must use the same encoding")
+            if descriptor["mode"] != first["mode"]:
+                raise ValueError("All images in a sequence must use the same pixel mode")
+            width, height = descriptor["size"]
+            if width * first_height != first_width * height:
+                raise ValueError("All images in a sequence must have the same aspect ratio")
+
+    def _existing_image_sequence_signature(self, run: str, dataset: str, variable: str) -> tuple | None:
+        row = self.cur.execute(
+            "select resolution.x, resolution.y, replica.name as replica_name, file.name as file_name "
+            "from logical_variable as logical "
+            "join campaign_run as campaign_run on campaign_run.runid = logical.runid "
+            "join dataset as owner on owner.rowid = logical.datasetid "
+            "join variable_chunk as chunk on chunk.variableid = logical.variableid "
+            "join replica on replica.datasetid = chunk.payload_datasetid and replica.deltime = 0 "
+            "left join resolution on resolution.replicaid = replica.rowid "
+            "left join repfiles on repfiles.replicaid = replica.rowid "
+            "left join file on file.fileid = repfiles.fileid "
+            "where campaign_run.name = ? and owner.name = ? and logical.name = ? "
+            "order by chunk.chunk_index, replica.rowid, file.fileid limit 1",
+            (run, dataset, variable),
+        ).fetchone()
+        if row is None or row["x"] is None or row["y"] is None:
+            return None
+        suffix = Path(str(row["replica_name"] or "")).suffix.lower()
+        if not suffix:
+            suffix = Path(str(row["file_name"] or "")).suffix.lower()
+        encoding = {
+            ".jpg": "JPEG",
+            ".jpeg": "JPEG",
+            ".png": "PNG",
+            ".gif": "GIF",
+            ".webp": "WEBP",
+            ".bmp": "BMP",
+            ".tif": "TIFF",
+            ".tiff": "TIFF",
+        }.get(suffix)
+        return (int(row["x"]), int(row["y"]), encoding)
+
+    @staticmethod
+    def _validate_image_sequence_append(descriptor: dict, existing_signature: tuple | None) -> None:
+        if existing_signature is None:
+            return
+        width, height, encoding = existing_signature
+        if descriptor["size"] != (width, height):
+            raise ValueError("Appended images must have the same resolution and aspect ratio as the sequence")
+        if encoding is not None and descriptor["format"] != encoding:
+            raise ValueError("Appended images must use the same encoding as the sequence")
 
     def _is_matplotlib_figure(self, image) -> bool:
         image_type = type(image)
@@ -648,321 +872,7 @@ class Manager:  # pylint: disable=too-many-public-methods
             buf = BytesIO()
             image.savefig(buf, format=resolved_format.lower())
             return buf.getvalue(), resolved_format
-        raise TypeError(f"Unsupported visualization image input type: {type(image)!r}")
-
-    def _validate_scalar_field_storage_options(self, layout: str, compression: str, encoding: str):
-        layout_value = str(layout or "").strip().lower()
-        if layout_value != "row-major":
-            raise ValueError("Only row-major scalar field layout is supported currently")
-
-        compression_value = str(compression or "").strip().lower()
-        if compression_value != "none":
-            raise ValueError("Only compression='none' is supported for scalar fields currently")
-
-        encoding_value = str(encoding or "").strip().lower()
-        if encoding_value != "raw":
-            raise ValueError("Only encoding='raw' is supported for scalar fields currently")
-
-    def _normalize_scalar_field_shape(self, shape: list[int] | tuple[int, int] | None) -> tuple[int, ...]:
-        shape_tuple = tuple(int(dim) for dim in shape) if shape is not None else ()
-        if shape_tuple and len(shape_tuple) != 2:
-            raise ValueError("shape=[height, width] must contain exactly two dimensions")
-        return shape_tuple
-
-    def _normalize_scalar_field_input_data(self, data):
-        if isinstance(data, memoryview):
-            return data.tobytes()
-        if isinstance(data, bytearray):
-            return bytes(data)
-        return data
-
-    def _scalar_field_storage_dtype(self, dtype) -> np.dtype:
-        storage_dtype = np.dtype(dtype).newbyteorder("<")
-        if storage_dtype.kind not in {"f", "u", "i"}:
-            raise ValueError(f"Unsupported scalar field dtype: {storage_dtype.name}")
-        return storage_dtype
-
-    def _coerce_scalar_field_bytes(
-        self,
-        data: bytes,
-        dtype: str | None,
-        shape_tuple: tuple[int, ...],
-    ) -> tuple[bytes, np.ndarray, np.dtype]:
-        if dtype is None:
-            raise ValueError("dtype is required when scalar field data is bytes")
-        if len(shape_tuple) != 2:
-            raise ValueError("shape=[height, width] is required when scalar field data is bytes")
-
-        storage_dtype = self._scalar_field_storage_dtype(dtype)
-        expected = math.prod(shape_tuple) * storage_dtype.itemsize
-        if len(data) != expected:
-            raise ValueError(f"Scalar field byte payload has {len(data)} bytes; expected {expected}")
-
-        arr = np.frombuffer(data, dtype=storage_dtype).reshape(shape_tuple)
-        return data, arr, storage_dtype
-
-    def _coerce_scalar_field_array(
-        self,
-        data,
-        dtype: str | None,
-        shape_tuple: tuple[int, ...],
-    ) -> tuple[bytes, np.ndarray, np.dtype, tuple[int, ...]]:
-        arr = np.asarray(data)
-        if arr.ndim != 2:
-            raise ValueError("scalar_field_data requires a rank-2 array or explicit shape=[height, width]")
-        if len(shape_tuple) == 2 and shape_tuple != tuple(int(dim) for dim in arr.shape):
-            raise ValueError(f"shape={list(shape_tuple)} does not match scalar field array shape={list(arr.shape)}")
-
-        array_shape = tuple(int(dim) for dim in arr.shape)
-        storage_dtype = self._scalar_field_storage_dtype(dtype if dtype is not None else arr.dtype)
-        arr = np.ascontiguousarray(arr.astype(storage_dtype, copy=False))
-        return arr.tobytes(order="C"), arr, storage_dtype, array_shape
-
-    def _build_scalar_field_metadata(
-        self,
-        metadata,
-        shape_tuple: tuple[int, ...],
-        storage_dtype: np.dtype,
-        arr: np.ndarray,
-    ) -> dict:
-        if shape_tuple[0] <= 0 or shape_tuple[1] <= 0:
-            raise ValueError("Scalar field shape must be [height, width] with positive dimensions")
-
-        scalar_metadata = dict(metadata or {})
-        value_encoding = str(scalar_metadata.get("value_encoding", "direct") or "direct").strip().lower()
-        if value_encoding != "direct":
-            raise ValueError("Only value_encoding='direct' is supported for scalar fields currently")
-        scalar_metadata.update(
-            {
-                "format_version": 1,
-                "kind": "scalarField",
-                "rank": 2,
-                "shape": [int(shape_tuple[0]), int(shape_tuple[1])],
-                "dtype": storage_dtype.name,
-                "byte_order": "little",
-                "layout": "row-major",
-                "encoding": "raw",
-                "compression": "none",
-                "value_encoding": "direct",
-            }
-        )
-
-        if "min" not in scalar_metadata or "max" not in scalar_metadata:
-            if storage_dtype.kind == "f":
-                finite = arr[np.isfinite(arr)]
-            else:
-                finite = arr.reshape(-1)
-            if finite.size:
-                scalar_metadata.setdefault("min", float(np.min(finite)))
-                scalar_metadata.setdefault("max", float(np.max(finite)))
-
-        return scalar_metadata
-
-    def _coerce_scalar_field_input(
-        self,
-        data,
-        dtype: str | None,
-        shape: list[int] | tuple[int, int] | None,
-        metadata,
-        layout: str,
-        compression: str,
-        encoding: str,
-    ) -> tuple[bytes, dict]:
-        self._validate_scalar_field_storage_options(layout, compression, encoding)
-        shape_tuple = self._normalize_scalar_field_shape(shape)
-        data = self._normalize_scalar_field_input_data(data)
-
-        if isinstance(data, bytes):
-            payload, arr, storage_dtype = self._coerce_scalar_field_bytes(data, dtype, shape_tuple)
-        else:
-            payload, arr, storage_dtype, shape_tuple = self._coerce_scalar_field_array(data, dtype, shape_tuple)
-
-        if len(shape_tuple) != 2:
-            raise ValueError("Scalar field shape must be [height, width] with positive dimensions")
-
-        scalar_metadata = self._build_scalar_field_metadata(metadata, shape_tuple, storage_dtype, arr)
-        return payload, scalar_metadata
-
-    def _normalize_visualization_variable_specs(self, variables, source_dataset: str | None):
-        if isinstance(variables, (str, dict, tuple)):
-            variable_list = [variables]
-        else:
-            variable_list = list(variables)
-        normalized = []
-        default_source_dataset = source_dataset or ""
-        for entry in variable_list:
-            if isinstance(entry, str):
-                normalized.append({"name": entry, "role": "primary", "source_dataset": default_source_dataset})
-                continue
-            if isinstance(entry, dict):
-                item = dict(entry)
-                if "source_dataset" not in item or not item.get("source_dataset"):
-                    item["source_dataset"] = default_source_dataset
-                if ("role" not in item or not item.get("role")) and item.get("use"):
-                    item["role"] = item["use"]
-                if "role" not in item or not item.get("role"):
-                    item["role"] = "primary"
-                normalized.append(item)
-                continue
-            if isinstance(entry, tuple):
-                if len(entry) == 0:
-                    continue
-                item = {"name": entry[0], "role": "primary", "source_dataset": default_source_dataset}
-                if len(entry) >= 2 and entry[1]:
-                    item["role"] = entry[1]
-                if len(entry) >= 3 and entry[2]:
-                    item["source_dataset"] = entry[2]
-                normalized.append(item)
-                continue
-            raise TypeError(f"Unsupported variable specification: {entry!r}")
-        if not normalized:
-            raise ValueError("visualization requires at least one variable specification")
-        for item in normalized:
-            if not item.get("source_dataset"):
-                raise ValueError(f"Variable {item.get('name')!r} requires source_dataset")
-        return normalized
-
-    def _resolve_visualization_kind(self, kind: str | None, vis_type: str | None) -> str:
-        if kind and vis_type and kind != vis_type:
-            raise ValueError("visualization received both kind and vis_type with different values")
-        return str(kind or vis_type or "visualization")
-
-    def _semantic_variable_specs(
-        self,
-        variable: str | None,
-        color_by: str | None,
-        contour_by: str | None,
-        streamline_by,
-        x_axis: str | None,
-        y_axis,
-    ) -> list[dict[str, str]]:
-        specs: list[dict[str, str]] = []
-        if variable:
-            specs.append({"name": str(variable), "role": "primary"})
-        if color_by:
-            specs.append({"name": str(color_by), "role": "color-by"})
-        if contour_by:
-            specs.append({"name": str(contour_by), "role": "contour-by"})
-        if streamline_by:
-            if isinstance(streamline_by, (str, Path)):
-                specs.append({"name": str(streamline_by), "role": "streamline-by"})
-            else:
-                names = [str(entry) for entry in streamline_by]
-                if len(names) == 2:
-                    specs.append({"name": names[0], "role": "streamline-x"})
-                    specs.append({"name": names[1], "role": "streamline-y"})
-                else:
-                    for name in names:
-                        specs.append({"name": name, "role": "streamline-by"})
-        if x_axis:
-            specs.append({"name": str(x_axis), "role": "x-axis"})
-        if y_axis:
-            if isinstance(y_axis, (str, Path)):
-                y_names = [str(y_axis)]
-            else:
-                y_names = [str(entry) for entry in y_axis]
-            for name in y_names:
-                specs.append({"name": name, "role": "y-axis"})
-        return specs
-
-    def _build_visualization_variable_specs(
-        self,
-        variables,
-        variable: str | None,
-        color_by: str | None,
-        contour_by: str | None,
-        streamline_by,
-        x_axis: str | None,
-        y_axis,
-        source_dataset: str | None,
-    ):
-        semantic_specs = self._semantic_variable_specs(variable, color_by, contour_by, streamline_by, x_axis, y_axis)
-        if variables is not None and semantic_specs:
-            raise ValueError("Use either variables=... or semantic arguments, not both")
-        variable_inputs = variables if variables is not None else semantic_specs
-        return self._normalize_visualization_variable_specs(variable_inputs, source_dataset)
-
-    def _default_visualization_token(self, variables) -> str:
-        if len(variables) == 1 and variables[0]["role"] == "primary":
-            return str(variables[0]["name"])
-        parts = [f"{entry['role']}-{entry['name']}" for entry in variables]
-        return "__".join(parts)
-
-    def _default_visualization_name(self, source_dataset: str | None, variables) -> str:
-        root = source_dataset
-        if not root:
-            root = variables[0]["source_dataset"]
-        if not root:
-            root = "visualization"
-        return f"{root}/visualizations/{self._default_visualization_token(variables)}"
-
-    def _resolve_visualization_sequence_name(
-        self,
-        source_dataset: str | None,
-        name: str | None,
-        sequence_name: str | None,
-        variables,
-    ) -> str:
-        if name and sequence_name:
-            raise ValueError("Use either name or sequence_name, not both")
-        if sequence_name:
-            return str(sequence_name)
-        if not name:
-            return self._default_visualization_name(source_dataset, variables)
-        if "/" in str(name):
-            return str(name)
-        root = source_dataset or variables[0]["source_dataset"] or "visualization"
-        return f"{root}/visualizations/{name}"
-
-    def _resolve_visualization_image_names(
-        self,
-        image_inputs,
-        sequence_name: str,
-        image_names,
-        steps,
-        image_format: str | None,
-    ) -> list[str]:
-        if image_names is not None:
-            if isinstance(image_names, (str, Path)):
-                names = [str(image_names)]
-            else:
-                names = [str(entry) for entry in image_names]
-            if len(names) != len(image_inputs):
-                raise ValueError("image_names length must match number of images")
-            return names
-
-        if steps is not None:
-            step_values = [int(step) for step in steps]
-            if len(step_values) != len(image_inputs):
-                raise ValueError("steps length must match number of images")
-        else:
-            step_values = list(range(len(image_inputs)))
-
-        generated: list[str] = []
-        for step, image_input in zip(step_values, image_inputs, strict=True):
-            suffix = self._guess_image_suffix(image_input, image_format)
-            generated.append(f"{sequence_name}/image.{step:06d}{suffix}")
-        return generated
-
-    def _guess_image_suffix(self, image_input, image_format: str | None) -> str:
-        if isinstance(image_input, Path):
-            suffix = image_input.suffix
-            if suffix:
-                return suffix
-        if isinstance(image_input, str):
-            suffix = Path(image_input).suffix
-            if suffix:
-                return suffix
-        if image_format:
-            return "." + image_format.lower().lstrip(".")
-        if isinstance(image_input, (bytes, bytearray, memoryview)):
-            data = bytes(image_input)
-            inferred = self._infer_image_format(data)
-            if inferred == "JPEG":
-                return ".jpg"
-            if inferred:
-                return "." + inferred.lower()
-        return ".png"
+        raise TypeError(f"Unsupported image-sequence input type: {type(image)!r}")
 
 
 def _load_json_object(path: str, label: str) -> dict:
@@ -973,21 +883,128 @@ def _load_json_object(path: str, label: str) -> dict:
     return data
 
 
-def _load_scalar_field_cli_input(args: argparse.Namespace) -> tuple[bytes | np.ndarray, dict]:
-    input_path = Path(args.file)
-    metadata = _load_json_object(args.metadata_json, "scalar field metadata") if args.metadata_json else {}
-    if args.value_encoding is not None:
-        metadata["value_encoding"] = args.value_encoding
-
-    if input_path.suffix.lower() == ".npy":
-        return np.load(input_path, allow_pickle=False), metadata
-    return input_path.read_bytes(), metadata
-
-
-def _require_manifest_fields(manifest: dict, required_fields: tuple[str, ...]) -> None:
+def _require_manifest_fields(
+    manifest: dict,
+    required_fields: tuple[str, ...],
+    label: str = "manifest",
+) -> None:
     missing = [field for field in required_fields if field not in manifest]
     if missing:
-        raise ValueError(f"visualization sequence manifest is missing required field(s): {', '.join(missing)}")
+        raise ValueError(f"{label} is missing required field(s): {', '.join(missing)}")
+
+
+def _reject_unknown_manifest_fields(manifest: dict, supported_fields: set[str], label: str) -> None:
+    """Catch obsolete provenance fields and manifest typos instead of ignoring them."""
+    unknown = sorted(str(field) for field in manifest if field not in supported_fields)
+    if unknown:
+        raise ValueError(f"{label} contains unsupported field(s): {', '.join(unknown)}")
+
+
+def _manifest_variable_ref(value, label: str) -> VariableRef:
+    if not isinstance(value, dict):
+        raise TypeError(f"{label} must be an object with run, dataset, and variable fields")
+    _require_manifest_fields(value, ("dataset", "variable"), label)
+    return VariableRef(
+        str(value.get("run", DEFAULT_RUN)),
+        str(value["dataset"]),
+        str(value["variable"]),
+    )
+
+
+def _manifest_inputs(value, label: str = "inputs") -> dict[str, VariableRef]:
+    """Decode a role-qualified activity input mapping."""
+    if not isinstance(value, dict) or not value:
+        raise ValueError(f"{label} must be a non-empty role mapping")
+    return {str(role): _manifest_variable_ref(reference, f"{label}.{role}") for role, reference in value.items()}
+
+
+def _apply_variable_manifest(manager: Manager, manifest: dict, append: bool = False) -> VariableRef:
+    _require_manifest_fields(manifest, ("dataset", "variable"), "variable manifest")
+    _reject_unknown_manifest_fields(
+        manifest,
+        {
+            "run",
+            "dataset",
+            "variable",
+            "definition",
+            "chunks",
+            "primary",
+            "preferred_preview",
+            "append",
+        },
+        "variable manifest",
+    )
+    preview = manifest.get("preferred_preview")
+    return manager.add_variable(
+        dataset=manifest["dataset"],
+        variable=manifest["variable"],
+        run=manifest.get("run", DEFAULT_RUN),
+        definition=manifest.get("definition"),
+        chunks=manifest.get("chunks"),
+        primary=bool(manifest.get("primary", False)),
+        preferred_preview=(_manifest_variable_ref(preview, "preferred_preview") if preview is not None else None),
+        append=bool(manifest.get("append", False) or append),
+    )
+
+
+def _apply_activity_manifest(manager: Manager, manifest: dict) -> ActivityResult:
+    _require_manifest_fields(manifest, ("action", "inputs", "outputs"), "activity manifest")
+    _reject_unknown_manifest_fields(
+        manifest,
+        {"action", "inputs", "outputs", "action_spec", "source_steps"},
+        "activity manifest",
+    )
+    outputs = manifest["outputs"]
+    if not isinstance(outputs, dict) or not outputs:
+        raise ValueError("activity manifest outputs must be a non-empty role mapping")
+    return manager.add_activity(
+        action=str(manifest["action"]),
+        inputs=_manifest_inputs(manifest["inputs"]),
+        outputs=outputs,
+        action_spec=manifest.get("action_spec"),
+        source_steps=manifest.get("source_steps"),
+    )
+
+
+def _apply_image_sequence_manifest(manager: Manager, manifest: dict, append: bool = False) -> VariableRef:
+    _require_manifest_fields(
+        manifest,
+        ("dataset", "variable", "images", "inputs"),
+        "image-sequence manifest",
+    )
+    _reject_unknown_manifest_fields(
+        manifest,
+        {
+            "run",
+            "dataset",
+            "variable",
+            "definition",
+            "images",
+            "inputs",
+            "source_steps",
+            "action_spec",
+            "store",
+            "thumbnail",
+            "preferred_preview",
+            "append",
+        },
+        "image-sequence manifest",
+    )
+    preview = manifest.get("preferred_preview")
+    return manager.add_image_sequence(
+        dataset=manifest["dataset"],
+        variable=manifest["variable"],
+        images=manifest["images"],
+        inputs=_manifest_inputs(manifest["inputs"]),
+        run=manifest.get("run", DEFAULT_RUN),
+        definition=manifest.get("definition"),
+        source_steps=manifest.get("source_steps"),
+        action_spec=manifest.get("action_spec"),
+        store=bool(manifest.get("store", False)),
+        thumbnail=manifest.get("thumbnail"),
+        preferred_preview=(_manifest_variable_ref(preview, "preferred_preview") if preview is not None else None),
+        append=bool(manifest.get("append", False) or append),
+    )
 
 
 # pylint:disable = too-many-statements
@@ -1010,7 +1027,6 @@ def main(args=None, prog=None):
         create_allowed = True
         if parser.args.command in (
             "info",
-            "visualization-sequence",
             "add-archival-storage",
             "archived-replica",
             "time-series",
@@ -1028,45 +1044,22 @@ def main(args=None, prog=None):
             info_data = manager.info(
                 parser.args.list_replicas, parser.args.list_files, parser.args.show_deleted, parser.args.show_checksum
             )
-            if parser.args.images:
-                print_image_associations(info_data)
-            else:
-                print_info(info_data)
+            print_info(info_data)
         elif parser.args.command == "data":
             manager.data(parser.args.files, parser.args.name)
         elif parser.args.command == "text":
             manager.text(parser.args.files, parser.args.name, parser.args.store)
         elif parser.args.command == "schema":
             manager.set_schema(parser.args.schema_file)
-        elif parser.args.command == "image":
-            manager.image(parser.args.file, parser.args.name, parser.args.store, parser.args.thumbnail)
-        elif parser.args.command == "scalar-field":
-            scalar_data, scalar_metadata = _load_scalar_field_cli_input(parser.args)
-            manager.scalar_field_data(
-                scalar_data,
-                name=parser.args.name,
-                dtype=parser.args.dtype,
-                shape=parser.args.shape,
-                metadata=scalar_metadata,
-                layout=parser.args.layout,
-                compression=parser.args.compression,
-                encoding=parser.args.encoding,
-                replica_name=parser.args.replica_name,
-            )
-        elif parser.args.command == "visualization-sequence":
-            manifest = _load_json_object(parser.args.manifest, "visualization sequence manifest")
-            _require_manifest_fields(manifest, ("name", "vis_type", "variables", "items"))
-            manager.visualization_sequence(
-                name=manifest["name"],
-                vis_type=manifest["vis_type"],
-                variables=manifest["variables"],
-                items=manifest["items"],
-                source_dataset=manifest.get("source_dataset"),
-                thumbnail_name=manifest.get("thumbnail_name"),
-                thumbnail_uuid=manifest.get("thumbnail_uuid"),
-                metadata=manifest.get("metadata"),
-                replace=bool(manifest.get("replace", False) or parser.args.replace),
-            )
+        elif parser.args.command == "variable":
+            manifest = _load_json_object(parser.args.manifest, "variable manifest")
+            _apply_variable_manifest(manager, manifest, append=parser.args.append)
+        elif parser.args.command == "activity":
+            manifest = _load_json_object(parser.args.manifest, "activity manifest")
+            _apply_activity_manifest(manager, manifest)
+        elif parser.args.command == "image-sequence":
+            manifest = _load_json_object(parser.args.manifest, "image-sequence manifest")
+            _apply_image_sequence_manifest(manager, manifest, append=parser.args.append)
         elif parser.args.command == "delete":
             if parser.args.uuid is not None:
                 for uid in parser.args.uuid:

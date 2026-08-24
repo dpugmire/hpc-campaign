@@ -10,7 +10,6 @@
 import argparse
 import csv
 import glob
-import json
 import re
 import sqlite3
 import sys
@@ -41,23 +40,7 @@ from .utils import (
     sql_commit,
     sql_execute,
 )
-
-SCALAR_FIELD_FORMAT = "SCALAR_FIELD"
-SCALAR_FIELD_KIND = "scalarField"
-SCALAR_FIELD_SEQUENCE_COMPATIBILITY_KEYS = (
-    "rank",
-    "shape",
-    "dtype",
-    "byte_order",
-    "layout",
-    "encoding",
-    "compression",
-    "value_encoding",
-)
-SUPPORTED_VISUALIZATION_ITEM_FORMATS = {
-    "IMAGE": "IMAGE",
-    SCALAR_FIELD_FORMAT: SCALAR_FIELD_FORMAT,
-}
+from .variables import ensure_variable_tables
 
 
 def find_host_def(args: argparse.Namespace, hostname: str) -> dict | str | None:
@@ -368,360 +351,6 @@ def add_resolution_to_archive(
     return row_id
 
 
-def ensure_scalar_field_tables(cur: sqlite3.Cursor, con: sqlite3.Connection):
-    sql_execute(
-        cur,
-        "create table if not exists scalar_field" + "(datasetid INT PRIMARY KEY, metadata TEXT)",
-    )
-    sql_commit(con)
-
-
-def add_scalar_field_metadata_to_archive(
-    datasetid: int,
-    metadata: dict,
-    cur: sqlite3.Cursor,
-    indent: str = "",
-    verbose: bool = True,
-) -> int:
-    if verbose:
-        print(f"{indent}Add scalar field metadata for dataset {datasetid} to archive")
-    cur_ds = sql_execute(
-        cur,
-        "insert into scalar_field (datasetid, metadata) values (?, ?) "
-        "on conflict (datasetid) do update set metadata = excluded.metadata returning rowid",
-        (datasetid, json.dumps(metadata, sort_keys=True)),
-    )
-    row_id = cur_ds.fetchone()[0]
-    return row_id
-
-
-def _scalar_field_metadata_for_dataset(cur: sqlite3.Cursor, datasetid: int, dataset_name: str) -> dict:
-    res = sql_execute(cur, "select metadata from scalar_field where datasetid = ?", (datasetid,))
-    row = res.fetchone()
-    if row is None or not row[0]:
-        raise ValueError(f"SCALAR_FIELD dataset is missing scalar metadata: {dataset_name}")
-    try:
-        metadata = json.loads(row[0])
-    except Exception as exc:
-        raise ValueError(f"SCALAR_FIELD dataset has invalid scalar metadata: {dataset_name}") from exc
-    if not isinstance(metadata, dict):
-        raise ValueError(f"SCALAR_FIELD dataset metadata must be a JSON object: {dataset_name}")
-    return metadata
-
-
-def _scalar_field_sequence_signature(metadata: dict, dataset_name: str) -> tuple:
-    try:
-        shape = metadata.get("shape", [])
-        if not isinstance(shape, list) or len(shape) != 2:
-            raise ValueError
-        rank = int(metadata.get("rank", len(shape)))
-        shape_tuple = (int(shape[0]), int(shape[1]))
-        dtype = str(metadata.get("dtype", "") or "").strip()
-        byte_order = str(metadata.get("byte_order", "") or "").strip().lower()
-        layout = str(metadata.get("layout", "") or "").strip().lower()
-        encoding = str(metadata.get("encoding", "") or "").strip().lower()
-        compression = str(metadata.get("compression", "") or "").strip().lower()
-        value_encoding = str(metadata.get("value_encoding", "") or "").strip().lower()
-    except Exception as exc:
-        raise ValueError(f"SCALAR_FIELD dataset has invalid shape/rank metadata: {dataset_name}") from exc
-
-    normalized = {
-        "rank": rank,
-        "shape": shape_tuple,
-        "dtype": dtype,
-        "byte_order": byte_order,
-        "layout": layout,
-        "encoding": encoding,
-        "compression": compression,
-        "value_encoding": value_encoding,
-    }
-    missing = [key for key, value in normalized.items() if value in {"", ()}]
-    if missing:
-        raise ValueError(f"SCALAR_FIELD dataset metadata is missing {', '.join(missing)}: {dataset_name}")
-    if rank != 2:
-        raise ValueError(f"SCALAR_FIELD visualization items must be rank 2: {dataset_name}")
-    if shape_tuple[0] <= 0 or shape_tuple[1] <= 0:
-        raise ValueError(f"SCALAR_FIELD visualization item shape dimensions must be positive: {dataset_name}")
-
-    return tuple(normalized[key] for key in SCALAR_FIELD_SEQUENCE_COMPATIBILITY_KEYS)
-
-
-def ensure_visualization_tables(cur: sqlite3.Cursor, con: sqlite3.Connection):
-    sql_execute(
-        cur,
-        "create table if not exists visualization_sequence"
-        + "(visid INTEGER PRIMARY KEY, name TEXT UNIQUE, vistype TEXT, thumbnail_itemuuid TEXT, metadata TEXT)",
-    )
-    sql_execute(
-        cur,
-        "create table if not exists visualization_variable"
-        + " (visid INT, datasetid INT, variable_name TEXT, role TEXT, "
-        + "PRIMARY KEY (visid, datasetid, variable_name, role))",
-    )
-    sql_execute(
-        cur,
-        "create table if not exists visualization_item"
-        + " (visid INT, item_order INT, item_type TEXT, item_uuid TEXT, metadata TEXT, "
-        + "PRIMARY KEY (visid, item_order))",
-    )
-    sql_commit(con)
-
-
-def _serialize_visualization_metadata(metadata) -> str | None:
-    if metadata is None:
-        return None
-    if isinstance(metadata, str):
-        metadata_str = metadata.strip()
-        return metadata_str or None
-    return json.dumps(metadata, sort_keys=True)
-
-
-def _resolve_live_dataset(cur: sqlite3.Cursor, dataset_name: str) -> tuple[int, str, str]:
-    res = sql_execute(
-        cur,
-        "select rowid, uuid, fileformat from dataset where name = ? and deltime = 0",
-        (dataset_name,),
-    )
-    row = res.fetchone()
-    if row is None:
-        raise LookupError(f"Dataset not found or deleted: {dataset_name}")
-    return int(row[0]), str(row[1]), str(row[2])
-
-
-def _resolve_live_dataset_by_uuid(cur: sqlite3.Cursor, dataset_uuid: str) -> tuple[int, str, str]:
-    res = sql_execute(
-        cur,
-        "select rowid, name, fileformat from dataset where uuid = ? and deltime = 0 order by rowid limit 1",
-        (dataset_uuid,),
-    )
-    row = res.fetchone()
-    if row is None:
-        raise LookupError(f"Dataset UUID not found or deleted: {dataset_uuid}")
-    return int(row[0]), str(row[1]), str(row[2])
-
-
-def _normalize_visualization_variable_specs(variables, default_source_dataset: str = "") -> list[dict[str, str]]:
-    if not variables:
-        raise ValueError("visualization_sequence requires at least one variable specification")
-
-    normalized: list[dict[str, str]] = []
-    for entry in variables:
-        variable_name = ""
-        role = "primary"
-        source_dataset_name = default_source_dataset
-
-        if isinstance(entry, str):
-            variable_name = entry.strip()
-        elif isinstance(entry, dict):
-            variable_name = str(entry.get("name", "") or "").strip()
-            role = str(entry.get("role", entry.get("use", "primary")) or "primary").strip()
-            source_dataset_name = str(
-                entry.get("source_dataset", default_source_dataset) or default_source_dataset
-            ).strip()
-        elif isinstance(entry, (list, tuple)):
-            if len(entry) == 0:
-                continue
-            variable_name = str(entry[0]).strip()
-            if len(entry) >= 2:
-                role = str(entry[1] or "primary").strip()
-            if len(entry) >= 3:
-                source_dataset_name = str(entry[2] or default_source_dataset).strip()
-        else:
-            raise ValueError(f"Unsupported visualization variable spec: {entry!r}")
-
-        if not variable_name:
-            raise ValueError(f"Invalid visualization variable spec without a name: {entry!r}")
-        if not role:
-            role = "primary"
-        if not source_dataset_name:
-            raise ValueError(
-                f"Visualization variable '{variable_name}' must specify source_dataset or use source_dataset=..."
-            )
-        normalized.append(
-            {
-                "name": variable_name,
-                "role": role,
-                "source_dataset": source_dataset_name,
-            }
-        )
-
-    if not normalized:
-        raise ValueError("visualization_sequence requires at least one variable specification")
-    return normalized
-
-
-def _normalize_visualization_items(items) -> list[dict[str, str | None]]:
-    if not items:
-        raise ValueError("visualization_sequence requires at least one item")
-
-    normalized: list[dict[str, str | None]] = []
-    for item in items:
-        item_type = "IMAGE"
-        item_uuid = ""
-        item_name = ""
-        item_metadata = None
-
-        if isinstance(item, str):
-            item_name = item.strip()
-        elif isinstance(item, dict):
-            item_type = str(item.get("type", "IMAGE") or "IMAGE").strip().upper()
-            item_uuid = str(item.get("uuid", "") or "").strip()
-            item_name = str(item.get("name", "") or "").strip()
-            item_metadata = _serialize_visualization_metadata(item.get("metadata"))
-        else:
-            raise ValueError(f"Unsupported visualization item spec: {item!r}")
-
-        if item_type not in SUPPORTED_VISUALIZATION_ITEM_FORMATS:
-            supported = ", ".join(sorted(SUPPORTED_VISUALIZATION_ITEM_FORMATS))
-            raise ValueError(f"Unsupported visualization item type: {item_type}. Supported types: {supported}")
-        if not item_uuid and not item_name:
-            raise ValueError(f"Visualization item requires either name or uuid: {item!r}")
-        normalized.append(
-            {
-                "type": item_type,
-                "uuid": item_uuid or None,
-                "name": item_name or None,
-                "metadata": item_metadata,
-            }
-        )
-
-    return normalized
-
-
-def add_visualization_sequence(  # pylint: disable=too-many-statements
-    args: argparse.Namespace,
-    cur: sqlite3.Cursor,
-    con: sqlite3.Connection,
-) -> int:
-    ensure_visualization_tables(cur, con)
-
-    sequence_name = str(args.name or "").strip()
-    if not sequence_name:
-        raise ValueError("visualization_sequence requires a non-empty name")
-
-    vis_type = str(args.vis_type or "").strip()
-    if not vis_type:
-        raise ValueError("visualization_sequence requires a non-empty vis_type")
-
-    default_source_dataset = str(getattr(args, "source_dataset", "") or "").strip()
-    variable_specs = _normalize_visualization_variable_specs(args.variables, default_source_dataset)
-    item_specs = _normalize_visualization_items(args.items)
-    item_types = {str(item_spec["type"]) for item_spec in item_specs}
-    if len(item_types) > 1:
-        raise ValueError("Visualization sequence items must all have the same type; mixed item types are not supported")
-
-    source_dataset_ids: dict[str, int] = {}
-    for variable_spec in variable_specs:
-        dataset_name = variable_spec["source_dataset"]
-        if dataset_name not in source_dataset_ids:
-            dataset_id, _dataset_uuid, _fileformat = _resolve_live_dataset(cur, dataset_name)
-            source_dataset_ids[dataset_name] = dataset_id
-
-    thumbnail_itemuuid = None
-    thumbnail_name = str(getattr(args, "thumbnail_name", "") or "").strip()
-    thumbnail_uuid = str(getattr(args, "thumbnail_uuid", "") or "").strip()
-    if thumbnail_uuid:
-        _thumb_id, _thumb_name, thumb_fileformat = _resolve_live_dataset_by_uuid(cur, thumbnail_uuid)
-        if thumb_fileformat != "IMAGE":
-            raise ValueError(f"thumbnail_uuid must refer to an IMAGE dataset, not {thumb_fileformat}")
-        thumbnail_itemuuid = thumbnail_uuid
-    elif thumbnail_name:
-        _thumb_id, thumbnail_itemuuid, thumb_fileformat = _resolve_live_dataset(cur, thumbnail_name)
-        if thumb_fileformat != "IMAGE":
-            raise ValueError(f"thumbnail_name must refer to an IMAGE dataset, not {thumb_fileformat}")
-
-    resolved_items: list[dict[str, str | None]] = []
-    scalar_field_signature = None
-    scalar_field_signature_name = ""
-    for item_spec in item_specs:
-        item_uuid = item_spec["uuid"]
-        item_name = item_spec["name"]
-        if item_uuid:
-            item_id, resolved_name, item_fileformat = _resolve_live_dataset_by_uuid(cur, str(item_uuid))
-        else:
-            item_id, item_uuid, item_fileformat = _resolve_live_dataset(cur, str(item_name))
-            resolved_name = str(item_name)
-        expected_format = SUPPORTED_VISUALIZATION_ITEM_FORMATS[str(item_spec["type"])]
-        if item_fileformat != expected_format:
-            raise ValueError(
-                f"Visualization item type {item_spec['type']} must refer to a {expected_format} dataset, "
-                f"not {item_fileformat}"
-            )
-        if expected_format == SCALAR_FIELD_FORMAT:
-            scalar_metadata = _scalar_field_metadata_for_dataset(cur, item_id, resolved_name)
-            signature = _scalar_field_sequence_signature(scalar_metadata, resolved_name)
-            if scalar_field_signature is None:
-                scalar_field_signature = signature
-                scalar_field_signature_name = resolved_name
-            elif signature != scalar_field_signature:
-                raise ValueError(
-                    "All SCALAR_FIELD items in a visualization sequence must have compatible metadata "
-                    f"(rank, shape, dtype, byte order, layout, encoding, compression, value encoding). "
-                    f"First item: {scalar_field_signature_name}; mismatched item: {resolved_name}"
-                )
-        resolved_items.append(
-            {
-                "type": str(item_spec["type"]),
-                "uuid": str(item_uuid),
-                "metadata": item_spec["metadata"],
-            }
-        )
-
-    metadata_text = _serialize_visualization_metadata(args.metadata)
-
-    res = sql_execute(cur, "select visid from visualization_sequence where name = ?", (sequence_name,))
-    row = res.fetchone()
-    visid = None
-    if row is not None:
-        visid = int(row[0])
-        if not args.replace:
-            raise ValueError(f"Visualization sequence already exists: {sequence_name}")
-        sql_execute(
-            cur,
-            "update visualization_sequence set vistype = ?, thumbnail_itemuuid = ?, metadata = ? where visid = ?",
-            (vis_type, thumbnail_itemuuid, metadata_text, visid),
-        )
-        sql_execute(cur, "delete from visualization_variable where visid = ?", (visid,))
-        sql_execute(cur, "delete from visualization_item where visid = ?", (visid,))
-    else:
-        cur_vis = sql_execute(
-            cur,
-            "insert into visualization_sequence (name, vistype, thumbnail_itemuuid, metadata) "
-            "values (?, ?, ?, ?) returning visid",
-            (sequence_name, vis_type, thumbnail_itemuuid, metadata_text),
-        )
-        visid = int(cur_vis.fetchone()[0])
-
-    for variable_spec in variable_specs:
-        source_dataset_name = variable_spec["source_dataset"]
-        sql_execute(
-            cur,
-            "insert into visualization_variable (visid, datasetid, variable_name, role) values (?, ?, ?, ?)",
-            (
-                visid,
-                source_dataset_ids[source_dataset_name],
-                variable_spec["name"],
-                variable_spec["role"],
-            ),
-        )
-
-    for item_order, item_spec in enumerate(resolved_items):
-        sql_execute(
-            cur,
-            "insert into visualization_item (visid, item_order, item_type, item_uuid, metadata) values (?, ?, ?, ?, ?)",
-            (
-                visid,
-                item_order,
-                item_spec["type"],
-                item_spec["uuid"],
-                item_spec["metadata"],
-            ),
-        )
-
-    sql_commit(con)
-    return visid
-
-
 def process_data(
     args: argparse.Namespace,
     cur: sqlite3.Cursor,
@@ -884,51 +513,49 @@ def process_image(
     )
     add_resolution_to_archive(rep_id, imgres[0], imgres[1], cur, indent="  ", verbose=verbose)
 
-    if args.store or args.thumbnail is not None:
-        imgsuffix = Path(args.file).suffix
-        if args.store:
-            if verbose:
-                print("Storing the image in the archive")
-            resname = f"{imgres[0]}x{imgres[1]}{imgsuffix}"
-            add_file_to_archive(args, args.file, cur, rep_id, mt, resname, compress=False, indent="  ")
+    imgsuffix = Path(args.file).suffix
+    if args.store:
+        if verbose:
+            print("Storing the image in the archive")
+        resname = f"{imgres[0]}x{imgres[1]}{imgsuffix}"
+        add_file_to_archive(args, args.file, cur, rep_id, mt, resname, compress=False, indent="  ")
 
-        else:
-            if verbose:
-                print(f"  Make thumbnail image with resolution {args.thumbnail}")
-            img.thumbnail(args.thumbnail)
-            imgres = img.size
-            resname = f"{imgres[0]}x{imgres[1]}{imgsuffix}"
-            now = time_ns()
-            thumbfilename = "/tmp/" + basename(resname)
-            img.save(thumbfilename)
-            statres = stat(thumbfilename)
-            mt = statres.st_mtime_ns
-            filesize = statres.st_size
-            thumb_rep_id = add_replica_to_archive(
-                host_id,
-                dir_id,
-                0,
-                key_id,
-                join("thumbnails", args.file.lstrip("/")),
-                cur,
-                ds_id,
-                now,
-                filesize,
-                indent="  ",
-                verbose=verbose,
-            )
-            add_file_to_archive(
-                args,
-                thumbfilename,
-                cur,
-                thumb_rep_id,
-                now,
-                resname,
-                compress=False,
-                indent="  ",
-            )
-            add_resolution_to_archive(thumb_rep_id, imgres[0], imgres[1], cur, indent="  ", verbose=verbose)
-            remove(thumbfilename)
+    if args.thumbnail is not None:
+        if verbose:
+            print(f"  Make thumbnail image with resolution {args.thumbnail}")
+        thumb_img = img.copy()
+        thumb_img.thumbnail(args.thumbnail)
+        thumb_res = thumb_img.size
+        thumb_buffer = BytesIO()
+        thumb_img.save(thumb_buffer, format=img.format)
+        thumb_bytes = thumb_buffer.getvalue()
+        resname = f"{thumb_res[0]}x{thumb_res[1]}{imgsuffix}"
+        now = time_ns()
+        thumb_rep_id = add_replica_to_archive(
+            host_id,
+            dir_id,
+            0,
+            key_id,
+            join("thumbnails", args.file.lstrip("/")),
+            cur,
+            ds_id,
+            now,
+            len(thumb_bytes),
+            indent="  ",
+            verbose=verbose,
+        )
+        add_file_to_archive(
+            args,
+            "",
+            cur,
+            thumb_rep_id,
+            now,
+            resname,
+            compress=False,
+            content=thumb_bytes,
+            indent="  ",
+        )
+        add_resolution_to_archive(thumb_rep_id, thumb_res[0], thumb_res[1], cur, indent="  ", verbose=verbose)
 
 
 def process_image_data(
@@ -1023,105 +650,6 @@ def process_image_data(
             indent="  ",
         )
         add_resolution_to_archive(thumb_rep_id, thumb_res[0], thumb_res[1], cur, indent="  ", verbose=verbose)
-
-
-def process_scalar_field_data(
-    args: argparse.Namespace,
-    cur: sqlite3.Cursor,
-    host_id: int,
-    dir_id: int,
-    key_id: int,
-    dirpath: str,
-    location: str,
-):
-    payload = bytes(args.scalar_field_data)
-    metadata = dict(getattr(args, "scalar_field_metadata", {}) or {})
-    if not payload:
-        raise ValueError("scalar_field_data requires a non-empty payload")
-
-    if metadata.get("kind") != SCALAR_FIELD_KIND:
-        raise ValueError(f"scalar_field_data metadata.kind must be {SCALAR_FIELD_KIND!r}")
-    if str(metadata.get("encoding", "") or "").lower() != "raw":
-        raise ValueError("Only raw scalar field encoding is supported currently")
-    if str(metadata.get("compression", "") or "").lower() != "none":
-        raise ValueError("Only uncompressed scalar field payloads are supported currently")
-
-    shape = metadata.get("shape", [])
-    if not isinstance(shape, list) or len(shape) != 2:
-        raise ValueError("scalar_field_data metadata.shape must be [height, width]")
-    height = int(shape[0])
-    width = int(shape[1])
-    if height <= 0 or width <= 0:
-        raise ValueError("scalar_field_data shape dimensions must be positive")
-
-    dtype = str(metadata.get("dtype", "") or "").strip()
-    if not dtype:
-        raise ValueError("scalar_field_data metadata.dtype is required")
-
-    if args.name is not None:
-        dataset = args.name
-        unique_id = uuid.uuid3(uuid.NAMESPACE_URL, location + "/" + dataset).hex
-    else:
-        checksum = sha1(payload + json.dumps(metadata, sort_keys=True).encode("utf-8")).hexdigest()
-        unique_id = uuid.uuid5(uuid.NAMESPACE_OID, checksum).hex
-        dataset = f"memory-scalar-fields/scalar-{unique_id[:12]}.raw"
-
-    replica_name = getattr(args, "replica_name", "") or join("memory-scalar-fields", f"{unique_id}.raw")
-
-    mt = time_ns()
-    verbose = is_verbose(args)
-    if verbose:
-        print(f"Process in-memory scalar field {dataset}")
-
-    ds_id = add_dataset_to_archive(dataset, cur, unique_id, SCALAR_FIELD_FORMAT, mt, indent="  ", verbose=verbose)
-    rep_id = add_replica_to_archive(
-        host_id,
-        dir_id,
-        0,
-        key_id,
-        replica_name,
-        cur,
-        ds_id,
-        mt,
-        len(payload),
-        indent="  ",
-        verbose=verbose,
-    )
-    add_resolution_to_archive(rep_id, width, height, cur, indent="  ", verbose=verbose)
-    add_scalar_field_metadata_to_archive(ds_id, metadata, cur, indent="  ", verbose=verbose)
-
-    safe_dtype = re.sub(r"[^A-Za-z0-9_.-]+", "_", dtype)
-    resname = f"{width}x{height}.{safe_dtype}.raw"
-    add_file_to_archive(args, "", cur, rep_id, mt, resname, compress=False, content=payload, indent="  ")
-
-
-def add_image_data(args: argparse.Namespace, cur: sqlite3.Cursor, con: sqlite3.Connection):
-    long_host_name, short_host_name = get_host_name(args)
-    verbose = is_verbose(args)
-
-    host_id = add_host_name(long_host_name, short_host_name, cur, verbose=verbose)
-    key_id = add_key_id(args.encryption_key_id, cur, verbose=verbose)
-    rootdir = getcwd()
-    dir_id = add_directory(host_id, rootdir, cur, verbose=verbose)
-    sql_commit(con)
-
-    process_image_data(args, cur, host_id, dir_id, key_id, long_host_name + rootdir, rootdir)
-    sql_commit(con)
-
-
-def add_scalar_field_data(args: argparse.Namespace, cur: sqlite3.Cursor, con: sqlite3.Connection):
-    ensure_scalar_field_tables(cur, con)
-    long_host_name, short_host_name = get_host_name(args)
-    verbose = is_verbose(args)
-
-    host_id = add_host_name(long_host_name, short_host_name, cur, verbose=verbose)
-    key_id = add_key_id(args.encryption_key_id, cur, verbose=verbose)
-    rootdir = getcwd()
-    dir_id = add_directory(host_id, rootdir, cur, verbose=verbose)
-    sql_commit(con)
-
-    process_scalar_field_data(args, cur, host_id, dir_id, key_id, long_host_name + rootdir, rootdir)
-    sql_commit(con)
 
 
 # pylint: disable=too-many-statements
@@ -1751,8 +1279,7 @@ def create_tables(campaign_file_name: str, con: sqlite3.Connection):
         cur,
         "create table archive" + "(dirid INT, tarname TEXT,system TEXT, notes BLOB, PRIMARY KEY (dirid, tarname))",
     )
-    ensure_visualization_tables(cur, con)
-    ensure_scalar_field_tables(cur, con)
+    ensure_variable_tables(cur)
     sql_execute(
         cur,
         "create table archiveidx"
@@ -1779,6 +1306,7 @@ def delete_dataset_if_empty(
     )
     replicas = res.fetchall()
     if len(replicas) == 0:
+        _assert_dataset_not_used_by_variables(cur, datasetid)
         print("{indent}  Dataset without replicas found. Deleting.")
         sql_execute(
             cur,
@@ -1800,6 +1328,16 @@ def delete_replica(
     datasetid = 0
     for rep in replicas:
         datasetid = rep[0]
+        if delete_empty_dataset:
+            live_replica_count = int(
+                sql_execute(
+                    cur,
+                    "select count(*) from replica where datasetid = ? and deltime = 0",
+                    (datasetid,),
+                ).fetchone()[0]
+            )
+            if live_replica_count <= 1:
+                _assert_dataset_not_used_by_variables(cur, datasetid)
         sql_execute(
             cur,
             f"update replica set deltime = {CURRENT_TIME} " + f"where rowid = {repid}",
@@ -1819,27 +1357,49 @@ def delete_dataset(
 ):
     if len(name) > 0:
         print(f"Delete dataset with name {name}")
-        cur_ds = sql_execute(
-            cur,
-            f'update dataset set deltime = {CURRENT_TIME} where name = "{name}" returning rowid',
-        )
+        target = sql_execute(cur, "select rowid from dataset where name = ?", (name,)).fetchone()
     elif len(uniqueid) > 0:
         print(f"Delete dataset with uuid = {uniqueid}")
-        cur_ds = sql_execute(
-            cur,
-            f'update dataset set deltime = {CURRENT_TIME} where uuid = "{uniqueid}" returning rowid',
-        )
+        target = sql_execute(cur, "select rowid from dataset where uuid = ?", (uniqueid,)).fetchone()
     else:
         raise LookupError("delete_dataset() requires name or unique id")
 
-    row_id = cur_ds.fetchone()[0]
+    if target is None:
+        raise LookupError("Dataset not found")
+    row_id = int(target[0])
+    _assert_dataset_not_used_by_variables(cur, row_id)
+    sql_execute(cur, "update dataset set deltime = ? where rowid = ?", (CURRENT_TIME, row_id))
     res = sql_execute(
-        cur_ds,
+        cur,
         "select rowid from replica " + f" where datasetid = {row_id} and deltime = 0",
     )
     replicas = res.fetchall()
     for rep in replicas:
         delete_replica(args, cur, con, rep[0], False)
+
+
+def _assert_dataset_not_used_by_variables(cur: sqlite3.Cursor, datasetid: int) -> None:
+    """Reject storage deletion that would orphan a logical variable or chunk."""
+    table = sql_execute(
+        cur,
+        "select 1 from sqlite_master where type = 'table' and name = 'logical_variable'",
+    ).fetchone()
+    if table is None:
+        return
+    owner = sql_execute(
+        cur,
+        "select name from logical_variable where datasetid = ? limit 1",
+        (datasetid,),
+    ).fetchone()
+    payload = sql_execute(
+        cur,
+        "select lv.name from variable_chunk as chunk "
+        "join logical_variable as lv on lv.variableid = chunk.variableid "
+        "where chunk.payload_datasetid = ? limit 1",
+        (datasetid,),
+    ).fetchone()
+    if owner is not None or payload is not None:
+        raise ValueError("Dataset is referenced by a logical variable and cannot be deleted")
 
 
 def delete(args: argparse.Namespace, cur: sqlite3.Cursor, con: sqlite3.Connection):

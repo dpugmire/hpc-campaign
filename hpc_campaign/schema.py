@@ -2,6 +2,15 @@ import fnmatch
 import re
 from typing import Any, Mapping, Sequence
 
+# This is intentionally a small, controlled vocabulary. The category is
+# structural; producer-specific details belong in an optional action_spec.
+SUPPORTED_ACTIVITY_KINDS = {
+    "reduction": "transformation",
+    "projection": "transformation",
+    "quantity_of_interest": "analysis",
+    "visualization": "presentation",
+}
+
 
 class SchemaInterpretationError(ValueError):
     """Raised when a schema cannot be interpreted against available datasets."""
@@ -20,9 +29,9 @@ def interpret_schema_layout(
     normalized onto time-series groups. It intentionally does not open
     ADIOS/HDF5 data.
     """
-    schema_version = _schema_version(schema)
-    if schema_version != 1:
-        raise SchemaInterpretationError(f"Unsupported schema_version={schema_version}; expected 1")
+    schema_version = _supported_schema_version(schema)
+    # Action profiles are campaign-global and independent of file layout.
+    interpret_activity_profiles(schema)
 
     files = _mapping(schema.get("files"), "files")
     dataset_names = [str(name) for name in datasets]
@@ -55,6 +64,9 @@ def interpret_campaign_schema_layout(
     apply the same schema independently to each immediate child directory by
     resolving schema paths relative to that directory.
     """
+    # Validate global profiles before trying root or per-run layout so a
+    # profile error is not misleadingly reported with a run prefix.
+    interpret_activity_profiles(schema)
     dataset_names = [str(name) for name in datasets]
     timeseries_map = {str(name): [str(dataset) for dataset in values] for name, values in (timeseries or {}).items()}
 
@@ -128,6 +140,13 @@ def _schema_version(schema: Mapping[str, Any]) -> int:
         raise SchemaInterpretationError("schema_version must be an integer") from exc
 
 
+def _supported_schema_version(schema: Mapping[str, Any]) -> int:
+    version = _schema_version(schema)
+    if version not in {1, 2}:
+        raise SchemaInterpretationError(f"Unsupported schema_version={version}; expected 1 or 2")
+    return version
+
+
 def _mapping(value: Any, field_name: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise SchemaInterpretationError(f"{field_name} must be a mapping")
@@ -139,6 +158,170 @@ def _nonempty_string(value: Any, field_name: str) -> str:
     if not text:
         raise SchemaInterpretationError(f"{field_name} is required")
     return text
+
+
+def _string_list(value: Any, field_name: str) -> list[str]:
+    """Return a validated list of unique, non-empty schema identifiers."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise SchemaInterpretationError(f"{field_name} must be a list")
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item.strip():
+            raise SchemaInterpretationError(f"{field_name}[{index}] must be a non-empty string")
+        key = item.strip()
+        if key in seen:
+            raise SchemaInterpretationError(f"{field_name} contains duplicate key: {key}")
+        seen.add(key)
+        result.append(key)
+    return result
+
+
+def interpret_activity_profiles(schema: Mapping[str, Any]) -> dict[str, dict[str, Any]] | None:
+    """Normalize optional schema rules for activity action specifications.
+
+    The activity vocabulary is fixed by :data:`SUPPORTED_ACTIVITY_KINDS`.
+    Profiles do not add new actions; they only constrain keys in an action's
+    optional ``action_spec`` object.
+    """
+    version = _supported_schema_version(schema)
+    if "representation_profiles" in schema:
+        raise SchemaInterpretationError(
+            "representation_profiles is not supported by the activity-based provenance schema; use activity_profiles"
+        )
+    if version == 1:
+        if "activity_profiles" in schema:
+            raise SchemaInterpretationError("activity_profiles requires schema_version=2")
+        return None
+    if "activity_profiles" not in schema:
+        return None
+
+    raw_profiles = _mapping(schema.get("activity_profiles"), "activity_profiles")
+    profiles: dict[str, dict[str, Any]] = {}
+    for raw_action, raw_profile in raw_profiles.items():
+        if not isinstance(raw_action, str) or not raw_action.strip():
+            raise SchemaInterpretationError("activity profile names must be non-empty strings")
+        action = raw_action.strip()
+        if action not in SUPPORTED_ACTIVITY_KINDS:
+            allowed = ", ".join(SUPPORTED_ACTIVITY_KINDS)
+            raise SchemaInterpretationError(f"Unsupported activity profile {action!r}; allowed actions: {allowed}")
+        if action in profiles:
+            raise SchemaInterpretationError(f"Duplicate activity profile: {action}")
+        profiles[action] = _interpret_activity_profile(action, raw_profile)
+    return profiles
+
+
+def _interpret_activity_profile(action: str, raw_profile: Any) -> dict[str, Any]:
+    """Normalize one profile after its activity action has been validated."""
+    field_name = f"activity_profiles.{action}"
+    profile = _mapping(raw_profile, field_name)
+    unknown_profile_fields = sorted(str(key) for key in profile if key != "action_spec")
+    if unknown_profile_fields:
+        raise SchemaInterpretationError(
+            f"{field_name} contains unsupported field(s): {', '.join(unknown_profile_fields)}"
+        )
+
+    spec_field = f"{field_name}.action_spec"
+    spec_rules = _mapping(profile.get("action_spec", {}), spec_field)
+    supported_spec_fields = {"required", "optional", "allow_additional"}
+    unknown_spec_fields = sorted(str(key) for key in spec_rules if key not in supported_spec_fields)
+    if unknown_spec_fields:
+        raise SchemaInterpretationError(f"{spec_field} contains unsupported field(s): {', '.join(unknown_spec_fields)}")
+
+    required = _string_list(spec_rules.get("required"), f"{spec_field}.required")
+    optional = _string_list(spec_rules.get("optional"), f"{spec_field}.optional")
+    overlap = sorted(set(required).intersection(optional))
+    if overlap:
+        raise SchemaInterpretationError(f"{spec_field} keys cannot be both required and optional: {', '.join(overlap)}")
+
+    allow_additional = spec_rules.get("allow_additional", True)
+    if not isinstance(allow_additional, bool):
+        raise SchemaInterpretationError(f"{spec_field}.allow_additional must be a boolean")
+    return {
+        "action_spec": {
+            "required": required,
+            "optional": optional,
+            "allow_additional": allow_additional,
+        }
+    }
+
+
+def validate_action_spec(
+    action: str,
+    action_spec: Any,
+    profiles: Mapping[str, Mapping[str, Any]] | None,
+    *,
+    identity: str = "activity",
+) -> None:
+    """Validate one action and its optional specification against the schema."""
+    action_name = str(action or "").strip()
+    if action_name not in SUPPORTED_ACTIVITY_KINDS:
+        allowed = ", ".join(SUPPORTED_ACTIVITY_KINDS)
+        raise SchemaInterpretationError(f"{identity}: unsupported action={action_name!r}; allowed actions: {allowed}")
+
+    if action_spec is None:
+        specification: Mapping[str, Any] = {}
+    elif isinstance(action_spec, Mapping):
+        specification = action_spec
+    else:
+        raise SchemaInterpretationError(f"{identity}: action_spec must be an object")
+
+    invalid_keys = sorted(repr(key) for key in specification if not isinstance(key, str) or not key.strip())
+    if invalid_keys:
+        raise SchemaInterpretationError(
+            f"{identity}: action_spec keys must be non-empty strings: {', '.join(invalid_keys)}"
+        )
+
+    # An omitted profile leaves the specification producer-defined. This keeps
+    # profiles optional while the activity vocabulary remains controlled.
+    profile = profiles.get(action_name) if profiles is not None else None
+    if profile is None:
+        return
+
+    spec_rules = profile["action_spec"]
+    spec_keys = set(specification)
+    required_keys = set(spec_rules["required"])
+    missing = sorted(required_keys - spec_keys)
+    if missing:
+        raise SchemaInterpretationError(
+            f"{identity}: action_spec is missing required key(s) for {action_name!r}: {', '.join(missing)}"
+        )
+
+    if not spec_rules["allow_additional"]:
+        allowed_keys = required_keys.union(spec_rules["optional"])
+        additional = sorted(spec_keys - allowed_keys)
+        if additional:
+            raise SchemaInterpretationError(
+                f"{identity}: action_spec contains unsupported key(s) for {action_name!r}: " + ", ".join(additional)
+            )
+
+
+def validate_campaign_activities(
+    profiles: Mapping[str, Mapping[str, Any]] | None,
+    activities: Sequence[tuple[str, str, Any]],
+) -> dict[str, Any]:
+    """Validate stored activities and return a compact verification report."""
+    ordered = sorted(activities, key=lambda item: item[0])
+    errors: list[str] = []
+    specified = 0
+    for activity_uuid, action, action_spec in ordered:
+        if action_spec is not None:
+            specified += 1
+        try:
+            validate_action_spec(action, action_spec, profiles, identity=f"activity {activity_uuid}")
+        except SchemaInterpretationError as exc:
+            errors.append(str(exc))
+
+    if errors:
+        raise SchemaInterpretationError("Activity profile validation failed:\n- " + "\n- ".join(errors))
+    return {
+        "enforced": profiles is not None,
+        "activities_checked": len(ordered),
+        "specified_activities": specified,
+    }
 
 
 def _interpret_file_group(

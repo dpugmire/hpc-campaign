@@ -53,11 +53,11 @@ jobs:
     - name: Install campaigns and create campaign files from command line
       run: |
         pip3 install -e .
-        python3 -m hpc_campaign manager --campaign_store /tmp/campaign-store --hostname CI heat.aca create
         python3 -m hpc_campaign manager --campaign_store /tmp/campaign-store --hostname CI heat.aca data data/heat.bp --name heat
-        python3 -m hpc_campaign manager --campaign_store /tmp/campaign-store --hostname CI heat.aca image data/T00000.png --name T0 --store
-        python3 -m hpc_campaign manager --campaign_store /tmp/campaign-store --hostname CI heat.aca image data/T00001.png --name T1
-        python3 -m hpc_campaign manager --campaign_store /tmp/campaign-store --hostname CI heat.aca image data/T00002.png --name T2 --thumbnail 64 64
+        printf '%s\n' '{"run":"run-001","dataset":"heat","variable":"T","definition":"temperature","primary":true}' > /tmp/temperature.json
+        python3 -m hpc_campaign manager --campaign_store /tmp/campaign-store --hostname CI heat.aca variable /tmp/temperature.json
+        printf '%s\n' '{"run":"run-001","dataset":"images","variable":"temperature","definition":"temperature","images":["data/T*.png"],"inputs":{"source":{"run":"run-001","dataset":"heat","variable":"T"}},"source_steps":{"start":0,"count":3,"stride":1},"store":true,"thumbnail":[64,64]}' > /tmp/images.json
+        python3 -m hpc_campaign manager --campaign_store /tmp/campaign-store --hostname CI heat.aca image-sequence /tmp/images.json
         python3 -m hpc_campaign manager --campaign_store /tmp/campaign-store --hostname CI heat.aca info -rf
 
     - name: Run pytest on image

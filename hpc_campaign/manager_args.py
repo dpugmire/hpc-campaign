@@ -10,9 +10,9 @@ __accepted_commands__ = [
     "data",
     "text",
     "schema",
-    "image",
-    "scalar-field",
-    "visualization-sequence",
+    "variable",
+    "activity",
+    "image-sequence",
     "add-archival-storage",
     "archived-replica",
     "time-series",
@@ -89,8 +89,8 @@ class ArgParser:
             if len(args.files) > 1:
                 raise ValueError("Invalid arguments for text: when using --name <name>, only one text file is allowed")
 
-    # pylint: disable=too-many-locals,too-many-statements
-    def setup_args(self, prog: str | None) -> dict:
+    # pylint: disable=too-many-statements
+    def setup_args(self, prog: str | None) -> dict:  # pylint: disable=too-many-locals
         parser = argparse.ArgumentParser(
             prog=prog,
             formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -166,12 +166,6 @@ file:     [encryption key]  size  date  [cheksum]  filename
             help="List files embedded in campaign archive",
             action="store_true",
         )
-        parser_info.add_argument(
-            "-i",
-            "--images",
-            help="Print image datasets and their visualization associations",
-            action="store_true",
-        )
         parser_info.add_argument("-d", "--show-deleted", help="Show deleted entries", action="store_true")
         parser_info.add_argument("-c", "--show-checksum", help="Show checksums of files", action="store_true")
         parsers["info"] = parser_info
@@ -213,7 +207,6 @@ so be mindful about the size of the resulting archive. Text is stored compressed
         )
         parser_text.add_argument("--store", "-s", help="Store image in campaign", action="store_true")
 
-        # parser for the "schema" command
         parser_schema = argparse.ArgumentParser(
             prog=f"{prog} <archive> schema",
             formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -224,114 +217,32 @@ Store a campaign ingestion schema as embedded __campaign_schema.yaml text.
         parsers["schema"] = parser_schema
         parser_schema.add_argument("schema_file", help="schema file to store in the campaign")
 
-        # parser for the "image" command
-        parser_image = argparse.ArgumentParser(
-            prog=f"{prog} <archive> image",
+        parser_variable = argparse.ArgumentParser(
+            prog=f"{prog} <archive> variable",
             formatter_class=argparse.RawDescriptionHelpFormatter,
-            description="""
-Add an image file to the archive (remote reference by default).
-Multiple files with different resolutions can represent an image --name in the archive.
-The archive can '--store' directly the image file, or store a --thumbnail with X,Y size.
-""",
+            description="Create a logical variable or append chunks using a JSON manifest.",
         )
-        parsers["image"] = parser_image
-        parser_image.add_argument("file", help="image file")
-        parser_image.add_argument(
-            "--name",
-            "-n",
-            default=None,
-            help="Representation name in the campaign hierarchy",
-        )
-        parser_image.add_argument("--store", "-s", help="Store image in campaign", action="store_true")
-        parser_image.add_argument(
-            "--thumbnail",
-            nargs=2,
-            default=None,
-            type=int,
-            metavar=("x", "y"),
-            help="Store a resized image with resolution of x-by-y and refer to original",
-        )
+        parsers["variable"] = parser_variable
+        parser_variable.add_argument("manifest", help="JSON logical-variable manifest")
+        parser_variable.add_argument("--append", help="Append chunks to an existing variable", action="store_true")
 
-        # parser for the "scalar-field" command
-        parser_scalar_field = argparse.ArgumentParser(
-            prog=f"{prog} <archive> scalar-field",
+        parser_activity = argparse.ArgumentParser(
+            prog=f"{prog} <archive> activity",
             formatter_class=argparse.RawDescriptionHelpFormatter,
-            description="""
-Add a rank-2 scalar field to the archive. NumPy .npy inputs infer shape and
-dtype automatically unless overridden. Raw byte inputs require --shape and
---dtype so that the payload can be interpreted unambiguously.
-""",
+            description="Record an activity and create its outputs using a JSON manifest.",
         )
-        parsers["scalar-field"] = parser_scalar_field
-        parser_scalar_field.add_argument("file", help="raw scalar field file or NumPy .npy file")
-        parser_scalar_field.add_argument(
-            "--name",
-            "-n",
-            default=None,
-            help="Representation name in the campaign hierarchy",
-        )
-        parser_scalar_field.add_argument(
-            "--shape",
-            nargs=2,
-            default=None,
-            type=int,
-            metavar=("height", "width"),
-            help="Scalar field shape. Required for raw files; validates .npy array shape when supplied.",
-        )
-        parser_scalar_field.add_argument(
-            "--dtype",
-            default=None,
-            help="NumPy dtype for the scalar field. Required for raw files; converts .npy arrays when supplied.",
-        )
-        parser_scalar_field.add_argument(
-            "--layout",
-            default="row-major",
-            help="Scalar field memory layout. Currently only row-major is supported.",
-        )
-        parser_scalar_field.add_argument(
-            "--encoding",
-            default="raw",
-            help="Scalar field payload encoding. Currently only raw is supported.",
-        )
-        parser_scalar_field.add_argument(
-            "--compression",
-            default="none",
-            help="Scalar field payload compression. Currently only none is supported.",
-        )
-        parser_scalar_field.add_argument(
-            "--value-encoding",
-            default=None,
-            help="Scalar value representation. Currently only direct is supported.",
-        )
-        parser_scalar_field.add_argument(
-            "--metadata-json",
-            default=None,
-            metavar="file",
-            help="Optional JSON object with extra scalar field metadata.",
-        )
-        parser_scalar_field.add_argument(
-            "--replica-name",
-            default=None,
-            help="Optional replica name to store in the archive.",
-        )
+        parsers["activity"] = parser_activity
+        parser_activity.add_argument("manifest", help="JSON activity manifest")
 
-        # parser for the "visualization-sequence" command
-        parser_vis_sequence = argparse.ArgumentParser(
-            prog=f"{prog} <archive> visualization-sequence",
+        parser_image_sequence = argparse.ArgumentParser(
+            prog=f"{prog} <archive> image-sequence",
             formatter_class=argparse.RawDescriptionHelpFormatter,
-            description="""
-Add or replace a visualization sequence from a JSON manifest. The manifest
-contains the same fields as the Python Manager.visualization_sequence() API:
-name, vis_type, variables, items, and optional source_dataset, thumbnail_name,
-thumbnail_uuid, metadata, and replace.
-""",
+            description="Ingest an image sequence using a JSON manifest.",
         )
-        parsers["visualization-sequence"] = parser_vis_sequence
-        parser_vis_sequence.add_argument("manifest", help="JSON visualization sequence manifest")
-        parser_vis_sequence.add_argument(
-            "--replace",
-            help="Replace an existing visualization sequence with the same name",
-            action="store_true",
+        parsers["image-sequence"] = parser_image_sequence
+        parser_image_sequence.add_argument("manifest", help="JSON image-sequence manifest")
+        parser_image_sequence.add_argument(
+            "--append", help="Append images to an existing sequence", action="store_true"
         )
 
         # parser for the "add-archival-storage" command
@@ -440,35 +351,21 @@ One may need to run upgrade several times to reach the newest format.
             del args.store
         elif command == "schema":
             del args.schema_file
-        elif command == "image":
-            del args.name
-            del args.file
-            del args.store
-            del args.thumbnail
         elif command == "info":
             del args.show_deleted
             del args.show_checksum
             del args.list_replicas
             del args.list_files
-            del args.images
         elif command == "delete":
             del args.name
             del args.uuid
             del args.replica
-        elif command == "scalar-field":
-            del args.file
-            del args.name
-            del args.shape
-            del args.dtype
-            del args.layout
-            del args.encoding
-            del args.compression
-            del args.value_encoding
-            del args.metadata_json
-            del args.replica_name
-        elif command == "visualization-sequence":
+        elif command == "variable":
             del args.manifest
-            del args.replace
+            del args.append
+        elif command == "image-sequence":
+            del args.manifest
+            del args.append
         elif command == "add-archival-storage":
             del args.host
             del args.system

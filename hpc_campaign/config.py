@@ -11,7 +11,8 @@ ACA_VERSION = "0.7"
 # 0.4 added h5dataset table
 # 0.5 reorganized to "dataset" table, plus text and images, replicas, archives
 # 0.6 redefines "archive" as TAR files, throws away 0.5's archive concept
-# 0.7 separates file metadata from replica links via repfiles
+# 0.7 separates file metadata from replica links via repfiles and adds unified
+# logical variables, derivation edges, chunks, and source-step mappings
 
 REDIS_PORT = 6379
 

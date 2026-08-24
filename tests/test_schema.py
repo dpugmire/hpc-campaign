@@ -102,7 +102,10 @@ def test_set_schema_stores_example_as_embedded_campaign_schema_yaml(tmp_path: Pa
     assert stored["dataset_name"] == "__campaign_schema.yaml"
     assert stored["fileformat"] == "TEXT"
     assert stored["file_name"] == "__campaign_schema.yaml"
-    assert schema["schema_version"] == 1
+    # Most layout fixtures remain version 1; the activity-profile fixture
+    # exercises the version-2 extension.
+    expected_version = 2 if schema_path.stem == "code_activities" else 1
+    assert schema["schema_version"] == expected_version
     assert schema["name"] == schema_path.stem
     assert isinstance(schema["files"], dict)
 

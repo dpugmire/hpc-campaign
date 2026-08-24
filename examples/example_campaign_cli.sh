@@ -7,13 +7,17 @@
 ACA=$PWD/example_cli.aca
 
 # wipe the aca (in case it exists) to start from scratch
-# add a data file with a representation name
+# add the simulation data as a campaign dataset
 hpc_campaign manager $ACA --truncate data data/heat.bp  --name heat
 
-# add an image with a representation name
-hpc_campaign manager $ACA image data/T00000.png  --name T0
-hpc_campaign manager $ACA image data/T00001.png  --name T1 --store
-hpc_campaign manager $ACA image data/T00002.png  --name T2 --thumbnail 64 64
+# register the ADIOS temperature array as this run's primary source entity
+printf '%s\n' '{"run":"run-001","dataset":"heat","variable":"T","definition":"temperature","primary":true}' > /tmp/hpc-campaign-temperature.json
+hpc_campaign manager $ACA variable /tmp/hpc-campaign-temperature.json
+
+# record a visualization with T in the source role. The compact source_steps
+# descriptor maps the three images to source steps 0, 1, and 2.
+printf '%s\n' '{"run":"run-001","dataset":"images","variable":"temperature","definition":"temperature","images":["data/T*.png"],"inputs":{"source":{"run":"run-001","dataset":"heat","variable":"T"}},"source_steps":{"start":0,"count":3,"stride":1},"action_spec":{"colormap":"temperature"},"store":true,"thumbnail":[64,64]}' > /tmp/hpc-campaign-images.json
+hpc_campaign manager $ACA image-sequence /tmp/hpc-campaign-images.json
 
 # add a text file
 hpc_campaign manager $ACA text data/readme  --name readme --store
@@ -38,15 +42,8 @@ echo "faketape_dirID from info log:" ${faketape_dirID}
 # faking this, since there is no such location
 hpc_campaign manager $ACA archived-replica heat ${faketape_dirID} --newpath archivedheat.bp 
 
-# add a replica of T0 image located in the archival location (this has no embedded file)
-hpc_campaign manager $ACA archived-replica T0 ${faketape_dirID} 
-# add a replica of T1 image located in the archival location (this has embedded file)
-hpc_campaign manager $ACA archived-replica T1 ${faketape_dirID} 
-hpc_campaign manager $ACA delete --replica 3 
-
 # info
 hpc_campaign manager $ACA info -rfdc 
 
 # delete the aca
 # hpc_campaign rm --campaign_store $PWD example_cli.aca
-

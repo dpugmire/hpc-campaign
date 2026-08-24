@@ -45,9 +45,11 @@ The [sub-command] argument can take one of the following values
 
 * **add-archival-storage** Register an archival location (tape system, https, s3)
 * **archived-replica** Create a replica of a dataset pointing to an archival storage location
-* **dataset** Add ADIOS2 or HDF5 files
-* **delete** Delete dataset/image/text, one or all replicas from a campaign archive
-* **image** Add images, embedded or remote optionally with an embedded thumbnail image
+* **data** Add ADIOS2 or HDF5 files
+* **delete** Delete datasets or replicas from a campaign archive
+* **variable** Register a source data-product entity from a JSON manifest
+* **activity** Record an activity and atomically create its outputs from a JSON manifest
+* **image-sequence** Ingest images and record a visualization from a JSON manifest
 * **info** List the content of a campaign archive
 * **text** Add text files, embedded or just reference to remote file
 * **time-series** Organizing a series of individual datasets as a single entry with extra dimension for time
@@ -109,7 +111,7 @@ Example usage:
   hpc_campaign manager demoproject/test_campaign_001 dataset run_001.bp run_002.h5
 
 
-Additional option (`\-\-name <NAME>`) can specify the representation name for one dataset in the campaign hierarchy. The same option can be applied to the text and image sub-commands.
+The optional `\-\-name <NAME>` argument assigns the campaign dataset name.
 
 **4. delete**
 
@@ -126,88 +128,98 @@ The optional options specifies what will be deleted:
 * `\-\-name <str> [<str> ...]` removes datasets by their representation name.
 * `\-\-replica <id> [<id> ...]` removes replicas by their ID number.
 
-**5. image**
+**5. variable**
 
-Add an image files to the archive. By default, only a remote reference is stored for image files but it can be stored (`\-\-store``) or a thumbnail with a smaller resolution can be stored. 
-
-Example usage:
-
-.. code-block:: bash
-
-  hpc_campaign manager demoproject/test_campaign_001 image remote_image.png
-  hpc_campaign manager demoproject/test_campaign_001 image stored_image.png --store
-  hpc_campaign manager demoproject/test_campaign_001 image big_image.jpg --thumbnail 64 64
-
-
-Additional options for images include:
-* `\-\-name, -n <NAME>` representation name for one image in the campaign hierarchy
-* `\-\-store, -s` stores the image file directly in the campaign archive instead of just a reference.
-* `\-\-thumbnail <X> <Y>` stores a resized image with an X-by-Y resolution as a thumbnail, while referring to the original.
-
-**6. scalar-field**
-
-Add a rank-2 scalar field to the archive. Raw scalar field files require an
-explicit shape and dtype. NumPy ``.npy`` files infer shape and dtype from the
-array unless these are supplied to validate or convert the input.
-
-Example usage:
-
-.. code-block:: bash
-
-  hpc_campaign manager demoproject/test_campaign_001 scalar-field pressure.000000.raw \
-    --name output/visualizations/pressure_scalar_field/scalar.000000.raw \
-    --shape 128 128 \
-    --dtype float32
-
-  hpc_campaign manager demoproject/test_campaign_001 scalar-field pressure.000000.npy \
-    --name output/visualizations/pressure_scalar_field/scalar.000000.raw
-
-
-Additional options for scalar fields include:
-
-* ``--layout`` scalar field memory layout. Currently only ``row-major`` is supported.
-* ``--encoding`` scalar field payload encoding. Currently only ``raw`` is supported.
-* ``--compression`` scalar field payload compression. Currently only ``none`` is supported.
-* ``--value-encoding`` scalar value representation. Currently only ``direct`` is supported.
-* ``--metadata-json <FILE>`` adds extra scalar field metadata from a JSON object.
-
-**7. visualization-sequence**
-
-Add or replace a visualization sequence from a JSON manifest. This is the
-recommended CLI path for scalar-field sequences because variables and items are
-structured data.
-
-Example manifest:
+Register a source data-product entity using a JSON manifest:
 
 .. code-block:: json
 
   {
-    "name": "output/visualizations/pressure_scalar_field",
-    "vis_type": "heatmap",
-    "source_dataset": "output",
-    "variables": [{"name": "pressure", "role": "color-by"}],
-    "items": [
-      {
-        "type": "SCALAR_FIELD",
-        "name": "output/visualizations/pressure_scalar_field/scalar.000000.raw"
-      },
-      {
-        "type": "SCALAR_FIELD",
-        "name": "output/visualizations/pressure_scalar_field/scalar.000001.raw"
-      }
-    ],
-    "metadata": {"colormap": "viridis"},
-    "replace": true
+    "run": "run-001",
+    "dataset": "output.bp",
+    "variable": "pressure",
+    "definition": "pressure",
+    "primary": true
   }
-
-Example usage:
 
 .. code-block:: bash
 
-  hpc_campaign manager demoproject/test_campaign_001 visualization-sequence pressure_sequence.json
+  hpc_campaign manager run.aca variable pressure.json
 
+For a chunked source variable, add ``chunks``. Use ``--append`` to append
+payload chunks transactionally. Derived products are created by ``activity``.
 
-**8. info**
+**6. activity**
+
+Record one controlled action with role-qualified inputs and outputs:
+
+.. code-block:: json
+
+  {
+    "action": "reduction",
+    "inputs": {
+      "source": {
+        "run": "run-001",
+        "dataset": "output.bp",
+        "variable": "pressure"
+      }
+    },
+    "outputs": {
+      "result": {
+        "run": "run-001",
+        "dataset": "output.bp",
+        "variable": "pressure-mgard-1e-4",
+        "definition": "pressure"
+      }
+    },
+    "action_spec": {
+      "method": "mgard",
+      "error_bound": 0.0001
+    }
+  }
+
+.. code-block:: bash
+
+  hpc_campaign manager run.aca activity reduce-pressure.json
+
+The supported actions are ``reduction``, ``projection``,
+``quantity_of_interest``, and ``visualization``. Version-2
+``activity_profiles`` may constrain the allowed ``action_spec`` keys for
+selected actions.
+
+**7. image-sequence**
+
+Ingest an ordered image sequence and record its visualization activity:
+
+.. code-block:: json
+
+  {
+    "run": "run-001",
+    "dataset": "visualizations",
+    "variable": "pressure-volume",
+    "definition": "pressure",
+    "images": ["rendered/frame*.png"],
+    "inputs": {
+      "source": {
+        "run": "run-001",
+        "dataset": "output.bp",
+        "variable": "pressure-mgard-1e-4"
+      }
+    },
+    "source_steps": {"start": 0, "count": 3, "stride": 5},
+    "action_spec": {"colormap": "viridis"},
+    "thumbnail": [256, 256],
+    "store": false
+  }
+
+.. code-block:: bash
+
+  hpc_campaign manager run.aca image-sequence pressure-images.json
+
+Glob results are natural-sorted. Use ``--append`` for additional frames.
+See :doc:`data_provenance` for validation and provenance semantics.
+
+**10. info**
 
 Prints the content and metadata of a campaign archive file.
 Example usage:
@@ -219,7 +231,7 @@ Example usage:
 The optional options allow listing replicas, entries that have been deleted and checksums. A complete list of options can be found in the help menu (`-h` option).
 
 
-**9. text**
+**11. text**
 
 Add one or more text files to the archive. If requested, text files are stored within the archive. In that case, zlib is used to compress the text file.
 
@@ -305,7 +317,7 @@ Configuration:
   $ hpc_campaign manager demoproject/test_campaign_001 --truncate text runs/input-configuration.json
   $ hpc_campaign manager demoproject/test_campaign_001 dataset runs/simulation-output.bp runs/simulation-chekpoint.bp
   $ hpc_campaign manager demoproject/test_campaign_001 dataset analysis/pdf.bp
-  $ hpc_campaign manager demoproject/test_campaign_001 image analysis/plot-2d.png --store
+  $ hpc_campaign manager demoproject/test_campaign_001 image-sequence plot-images.json
 
   $ hpc_campaign manager demoproject/test_campaign_001 info
   =========================================================
@@ -333,4 +345,3 @@ Comparing the campaign archive size to the data it points to can be done by the 
 
   $ du -sh /path/to/adios-campaign-store/demoproject/test_campaign_001 info.aca
   127K     /path/to/adios-campaign-store/demoproject/test_campaign_001 info.aca
-

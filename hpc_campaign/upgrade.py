@@ -3,6 +3,7 @@ import sqlite3
 
 from .config import ACA_VERSION
 from .utils import sql_commit, sql_error_list, sql_execute
+from .variables import ensure_variable_tables
 
 
 # pylint:disable = unused-argument
@@ -128,6 +129,7 @@ def _upgrade_to_0_7(args: argparse.Namespace, cur: sqlite3.Cursor, con: sqlite3.
             (replicaid, fileid),
         )
     sql_execute(cur, "DROP TABLE file_old")
+    ensure_variable_tables(cur)
     # info: update version
     sql_execute(cur, 'UPDATE info SET version = "0.7"')
     if len(sql_error_list) == 0:

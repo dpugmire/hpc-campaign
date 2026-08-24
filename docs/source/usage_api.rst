@@ -42,7 +42,11 @@ The [sub-command] argument can take one of the following values
 
 * **add_archival_storage** Register an archival location (tape system, https, s3)
 * **data** Add ADIOS2 or HDF5 files
-* **image** Add images, embedded or remote optionally with an embedded thumbnail image
+* **add_variable** Register a source data-product entity
+* **set_primary_variable** Select a run's primary entity for a scientific definition
+* **add_activity** Record an action and atomically create its output entities
+* **add_image_sequence** Ingest images and record their visualization activity
+* **delete_variable** Delete a logical variable with relationship safeguards
 * **text** Add text files, embedded or just reference to remote file
 * **add_time_series** Organizing a series of individual data files as a single entry with extra dimension for time
 * **archived_replica** Create a replica of a dataset pointing to an archival storage location
@@ -107,82 +111,70 @@ Example usage:
   manager.data("data/heat.bp", name="heat")
   manager.data(["data/run_001.h5", "data/run_002.h5", "data/run_003.h5"])
 
-Additional option (`name="<NAME>"`) can specify the representation name for one dataset in the campaign hierarchy. The same option can be applied to the text and image sub-commands.
+The optional `name="<NAME>"` argument assigns the campaign dataset name.
 
-**3. image**
+**3. data products, activities, and image sequences**
 
-Add an image file to the archive. By default, only a remote reference is stored for image files but it can be stored (`store=True``) or a thumbnail with a smaller resolution can be stored (`thumbnail=[64, 64]`)
-
-Example usage:
-
-.. code-block:: python
-
-    manager.image("data/T0.png", name="T0")
-    manager.image("data/T1.png", name="T1", store=True)
-    manager.image("data/T2.png", name="T2", thumbnail=[64, 64])
-
-Additional options for images include:
-* `name="<NAME>"` representation name for the image in the campaign hierarchy
-
-**Derived visualizations**
-
-Use ``visualization`` when an image or image sequence is derived from variables
-in a data set already in the campaign. The method adds the image data and also
-records explicit metadata that links the visualization back to the source data
-set and variable uses. This is useful in notebooks where a user reads a
-variable, performs analysis, creates figures, and wants to save those figures
-back into the campaign.
-
-File-backed image inputs follow the same storage rule as ``image``: by default
-the campaign records a reference to the image file, and ``store=True`` embeds
-the image bytes in the archive. In-memory image inputs such as PNG/JPEG bytes,
-PIL Images, and matplotlib Figures have no external file path, so they require
-``store=True``.
-
-Example usage:
+Use ``add_variable`` to register a source entity. A reference is qualified by
+run, dataset, and variable name; each stored entity also has a stable UUID.
 
 .. code-block:: python
 
-  manager.data("runs/run001/output.bp", name="run001/output.bp")
-
-  # png_frames can be paths, PNG/JPEG bytes, PIL Images, or matplotlib Figures.
-  # replace=True makes rerunning a notebook cell update the same visualization.
-  manager.visualization(
-      images=png_frames,
-      source_dataset="run001/output.bp",
-      name="density",
-      kind="heatmap",
-      color_by="rho",
-      steps=[0, 1, 2],
-      store=True,
-      replace=True,
+  pressure = manager.add_variable(
+      run="run-001",
+      dataset="output.bp",
+      variable="pressure",
+      definition="pressure",
+      primary=True,
   )
 
-  manager.visualization(
-      images=overlay_frames,
-      source_dataset="run001/output.bp",
-      name="density_current_overlay",
-      kind="heatmap-contour",
-      color_by="rho",
-      contour_by="current_z",
-      replace=True,
+Derived products are outputs of controlled activities. Roles describe how each
+input and output participates. ``action_spec`` holds optional producer details;
+for example, MGARD is a reduction method rather than a data-product kind.
+
+.. code-block:: python
+
+  from hpc_campaign import VariableSpec
+
+  pressure_mgard = manager.add_activity(
+      action="reduction",
+      inputs={"source": pressure},
+      outputs={
+          "result": VariableSpec(
+              run="run-001",
+              dataset="output.bp",
+              variable="pressure-mgard-1e-4",
+              definition="pressure",
+          )
+      },
+      action_spec={"method": "mgard", "error_bound": 1e-4},
+  ).outputs["result"]
+
+The supported actions are ``reduction``, ``projection``,
+``quantity_of_interest``, and ``visualization``. A version-2 campaign schema
+may use ``activity_profiles`` to constrain action-spec keys for selected
+actions. Activity, input, output, chunk, and source-step writes are atomic.
+
+``add_image_sequence`` is the image-ingestion convenience API. Paths, globs,
+bytes, PIL images, and matplotlib figures are supported. In-memory images
+require ``store=True``.
+
+.. code-block:: python
+
+  pressure_images = manager.add_image_sequence(
+      run="run-001",
+      dataset="visualizations",
+      variable="pressure-volume",
+      definition="pressure",
+      images="rendered/pressure/frame*.png",
+      inputs={"source": pressure_mgard},
+      source_steps={"start": 0, "count": 200, "stride": 5},
+      action_spec={"colormap": "viridis"},
+      thumbnail=(256, 256),
   )
 
-  manager.visualization(
-      images=line_plot,
-      source_dataset="run001/output.bp",
-      name="mass_over_time",
-      kind="line-plot",
-      x_axis="time",
-      y_axis="mass",
-      replace=True,
-  )
-
-If ``name`` is a short token, the visualization sequence is stored under
-``<source_dataset>/visualizations/<name>``. For advanced use, pass
-``sequence_name`` to provide the exact sequence name. If image names are not
-provided explicitly, they are generated as children of the sequence name, using
-``steps`` when supplied.
+See :doc:`data_provenance` for graph, chunk, append, query, and deletion
+semantics and the activity-profile schema format.
 
 **4. text**
 
@@ -202,7 +194,7 @@ Example usage:
 
 
 Additional options for text include:
-* `name="<NAME>"` representation name for the image in the campaign hierarchy
+* `name="<NAME>"` campaign dataset name for the text payload
 * `store=True` stores the text file directly in the campaign archive instead of just a reference.
 
 **5. add_time_series**
@@ -368,7 +360,23 @@ Configuration:
     manager.text("runs/input-configuration.json", store=True)
     manager.data(["runs/simulation-output.bp" ,"runs/simulation-chekpoint.bp"])
     manager.data("analysis/pdf.bp")
-    manager.image("analysis/plot-2d.png", store=True)
+    pressure = manager.add_variable(
+        run="run-001",
+        dataset="runs/simulation-output.bp",
+        variable="pressure",
+        definition="pressure",
+        primary=True,
+    )
+    manager.add_image_sequence(
+        run="run-001",
+        dataset="analysis",
+        variable="plot-2d",
+        definition="pressure",
+        images="analysis/plot-2d.png",
+        inputs={"source": pressure},
+        action_spec={"view": "2d"},
+        store=True,
+    )
 
     info_data = manager.info(True, False, False, False)
     output = format_info(info_data)
