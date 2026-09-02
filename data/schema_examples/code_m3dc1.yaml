@@ -1,0 +1,128 @@
+schema_version: 1
+name: code_m3dc1
+
+files:
+  output:
+    role: time_series
+    mode: append
+    path: fwz3_2d_mgi3.rs4.bp
+
+axes:
+  field_time:
+    file: output
+    variable: metadata/time_values
+    kind: time
+
+  scalar_time:
+    file: output
+    variable: scalars/time
+    kind: time
+
+  simulation_timestep:
+    file: output
+    variable: metadata/ntimesteps
+    kind: timestep_index
+
+meshes:
+  m3dc1_mesh:
+    file: output
+    variable: mesh/elements
+    model: m3dc1_2d_unstructured_elements
+    columns: [a, b, c, theta, x1, y1, ibound, izone]
+
+basis:
+  m3dc1_basis:
+    file: output
+    variables:
+      mi: basis/mi
+      ni: basis/ni
+    model: m3dc1_reduced_quintic_2d_basis
+
+variable_groups:
+  fields:
+    file: output
+    pattern: fields/*
+    role: field
+    data_model: m3dc1_element_basis_coefficients
+    mesh: m3dc1_mesh
+    basis: m3dc1_basis
+    time_axis: field_time
+    timestep_axis: simulation_timestep
+
+  equilibrium_fields:
+    file: output
+    pattern: equilibrium/fields/*
+    role: field
+    data_model: m3dc1_element_basis_coefficients
+    mesh: m3dc1_mesh
+    basis: m3dc1_basis
+    static: true
+
+  scalars:
+    file: output
+    pattern: scalars/*
+    role: scalar_trace
+    x_axis: scalar_time
+
+  pellet:
+    file: output
+    pattern: pellet/*
+    role: pellet_trace
+    x_axis: scalar_time
+
+visualization_templates:
+  - name: P_2d
+    kind: field_2d
+    variables:
+      - role: color-by
+        variable: fields/P
+
+  - name: ne_2d
+    kind: field_2d
+    variables:
+      - role: color-by
+        variable: fields/ne
+
+  - name: te_2d
+    kind: field_2d
+    variables:
+      - role: color-by
+        variable: fields/te
+
+  - name: psi_2d
+    kind: field_2d
+    variables:
+      - role: color-by
+        variable: fields/psi
+
+  - name: P_with_psi_contours
+    kind: field_contour_overlay
+    variables:
+      - role: color-by
+        variable: fields/P
+      - role: contour
+        variable: fields/psi
+
+  - name: temax_timeseries
+    kind: timeseries
+    variables:
+      - role: x-axis
+        variable: scalars/time
+      - role: y-axis
+        variable: scalars/temax
+
+  - name: toroidal_current_timeseries
+    kind: timeseries
+    variables:
+      - role: x-axis
+        variable: scalars/time
+      - role: y-axis
+        variable: scalars/toroidal_current
+
+  - name: poincare
+    kind: poincare
+    variables:
+      - role: field-line-source
+        variable: fields/psi
+      - role: field-line-source
+        variable: fields/I
