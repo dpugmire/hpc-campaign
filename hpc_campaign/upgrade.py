@@ -2,6 +2,7 @@ import argparse
 import sqlite3
 
 from .config import ACA_VERSION
+from .prov_store import create_provenance_tables
 from .utils import sql_commit, sql_error_list, sql_execute
 
 
@@ -139,9 +140,25 @@ def _upgrade_to_0_7(args: argparse.Namespace, cur: sqlite3.Cursor, con: sqlite3.
     return "0.6"
 
 
+def _upgrade_to_0_8(args: argparse.Namespace, cur: sqlite3.Cursor, con: sqlite3.Connection) -> str:
+    """Add persistent campaign identity and canonical provenance storage."""
+
+    print("Upgrade to 0.8")
+    create_provenance_tables(cur)
+    sql_execute(cur, 'UPDATE info SET version = "0.8"')
+    if len(sql_error_list) == 0:
+        sql_commit(con)
+        return "0.8"
+
+    print("SQL Errors detected, drop all changes.")
+    con.rollback()
+    return "0.7"
+
+
 UPGRADESTEP = {
     "0.5": {"new_version": "0.6", "func": _upgrade_to_0_6},
     "0.6": {"new_version": "0.7", "func": _upgrade_to_0_7},
+    "0.7": {"new_version": "0.8", "func": _upgrade_to_0_8},
 }
 
 
