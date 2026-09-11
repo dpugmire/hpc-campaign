@@ -22,6 +22,31 @@ python examples/provenance_hello_world.py /tmp/provenance-hello-world
 The command creates a campaign archive and exports its W3C PROV graph as
 `/tmp/provenance-hello-world/provenance-hello-world.json`.
 
+## Example Campaigns
+
+Ready-to-run campaign examples are available in the
+[hpc-campaign-examples](https://github.com/ornladios/hpc-campaign-examples)
+repository. This companion repository shows how to use `hpc_campaign` in a
+complete scientific workflow instead of only through small API examples.
+
+The first example is a 2D uniform-grid ideal-MHD Orszag-Tang vortex campaign. It
+demonstrates how to run an ensemble, write ADIOS2 output, register those outputs
+in a campaign archive, validate the campaign against a schema, add derived
+analysis and statistics datasets, and store visualizations in the campaign.
+
+Use the examples repository when you want a working reference for building your
+own campaign:
+
+```
+git clone https://github.com/ornladios/hpc-campaign-examples.git
+cd hpc-campaign-examples
+```
+
+From there, follow the repository README to install the Python environment,
+build the example solver, run an ensemble, and create a campaign archive. The
+ensemble definitions, schema files, and scripts can also be copied or adapted as
+starting points for new application-specific campaigns.
+
 A Campaign Archive file can contain
 
 - metadata of ADIOS2 BP5 datasets 
